@@ -30,8 +30,8 @@ import { annotateInterSessionPromptText } from "../../sessions/input-provenance.
 import type { UserTurnTranscriptRecorder } from "../../sessions/user-turn-transcript.js";
 import type { SkillSnapshot } from "../../skills/types.js";
 import {
-  getGeneratedMediaTaskIdsForSessionKey,
-  hasNewGeneratedMediaTaskForSessionKey,
+  getGeneratedMediaTaskIdsForAnySessionKey,
+  hasNewGeneratedMediaTaskForAnySessionKey,
 } from "../../tasks/task-status-access.js";
 import { resolveUserPath } from "../../utils.js";
 import { resolveMessageChannel } from "../../utils/message-channel.js";
@@ -629,7 +629,7 @@ export function runAgentAttempt(params: {
               })) ?? params.sessionEntry;
           }
         };
-        const mediaTaskIdsBefore = getGeneratedMediaTaskIdsForSessionKey(params.sessionKey);
+        const mediaTaskIdsBefore = getGeneratedMediaTaskIdsForAnySessionKey(params.sessionKey);
         await prepareCliSessionBinding();
         // Retain the cleared binding as the preparation candidate so missing-transcript
         // recovery can reseed history without resuming the stale CLI session.
@@ -742,7 +742,7 @@ export function runAgentAttempt(params: {
               ? {
                   onBeforeForkedCliSessionRetry: async (retry) => {
                     if (
-                      hasNewGeneratedMediaTaskForSessionKey(
+                      hasNewGeneratedMediaTaskForAnySessionKey(
                         params.sessionKey,
                         mediaTaskIdsBefore,
                       ) ||
@@ -767,7 +767,7 @@ export function runAgentAttempt(params: {
               ? {
                   onBeforeFreshCliSessionRetry: async (retry) => {
                     if (
-                      hasNewGeneratedMediaTaskForSessionKey(
+                      hasNewGeneratedMediaTaskForAnySessionKey(
                         params.sessionKey,
                         mediaTaskIdsBefore,
                       ) ||
@@ -814,7 +814,7 @@ export function runAgentAttempt(params: {
               error: err,
               binding: failedCliSessionBinding,
               bindingReplacedDuringRun: failedCliSessionId !== cliSessionBinding?.sessionId,
-              hasNewGeneratedMediaTask: hasNewGeneratedMediaTaskForSessionKey(
+              hasNewGeneratedMediaTask: hasNewGeneratedMediaTaskForAnySessionKey(
                 params.sessionKey,
                 mediaTaskIdsBefore,
               ),

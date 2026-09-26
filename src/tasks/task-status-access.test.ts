@@ -6,7 +6,9 @@ import {
 import { resetGeneratedMediaTaskActivityForTests } from "./task-runtime.test-helpers.js";
 import {
   buildPendingGeneratedMediaSessionKeySet,
+  getGeneratedMediaTaskIdsForAnySessionKey,
   getGeneratedMediaTaskIdsForSessionKey,
+  hasNewGeneratedMediaTaskForAnySessionKey,
   hasNewGeneratedMediaTaskForSessionKey,
   hasPendingGeneratedMediaTaskForSessionKey,
 } from "./task-status-access.js";
@@ -61,6 +63,54 @@ describe("generated media task snapshots", () => {
       new Set(),
     );
     expect(mocks.listTaskRecords).not.toHaveBeenCalled();
+  });
+
+  it("never detects pending media for a plain (non-cron) session key via the exact-run helper", () => {
+    // Confirmed production bug: getGeneratedMediaTaskIdsForSessionKey only
+    // resolves a cron-run-exact session key (agent:<id>:cron:<job>:run:<runId>).
+    // A plain direct-message session key like this one always falls through
+    // its early return, so hasNewGeneratedMediaTaskForSessionKey can never
+    // observe pending generated media for it, and the protective guard in
+    // shouldClearFailedCliSessionBinding can never engage. This is now the
+    // documented, intentional scope of the exact-run helper; generic callers
+    // must use the *ForAnySessionKey variants below instead.
+    const directSessionKey = "agent:main:direct:user-1";
+    const tasks = [
+      {
+        taskId: "direct-image",
+        taskKind: "image_generation",
+        requesterSessionKey: directSessionKey,
+        ownerKey: directSessionKey,
+      },
+    ];
+    mocks.listTaskRecords.mockImplementation(() => tasks);
+
+    expect(getGeneratedMediaTaskIdsForSessionKey(directSessionKey)).toEqual(new Set());
+    expect(hasNewGeneratedMediaTaskForSessionKey(directSessionKey, new Set())).toBe(false);
+    expect(mocks.listTaskRecords).not.toHaveBeenCalled();
+  });
+
+  it("detects pending media for a plain (non-cron) session key via the any-session-key helper", () => {
+    const directSessionKey = "agent:main:direct:user-1";
+    const tasks = [
+      {
+        taskId: "direct-image",
+        taskKind: "image_generation",
+        requesterSessionKey: directSessionKey,
+        ownerKey: directSessionKey,
+      },
+    ];
+    mocks.listTaskRecords.mockImplementation(() => tasks);
+    const before = getGeneratedMediaTaskIdsForAnySessionKey(directSessionKey);
+
+    expect(hasNewGeneratedMediaTaskForAnySessionKey(directSessionKey, before)).toBe(false);
+    tasks.push({
+      taskId: "direct-video",
+      taskKind: "video_generation",
+      requesterSessionKey: directSessionKey,
+      ownerKey: directSessionKey,
+    });
+    expect(hasNewGeneratedMediaTaskForAnySessionKey(directSessionKey, before)).toBe(true);
   });
 
   it("tracks active media when a detached runtime does not mirror core tasks", () => {
