@@ -778,8 +778,11 @@ describe("executeAgentTurn: CLI session routing", () => {
     // (cosmetic: they should not look like the user switched models), but that
     // must not also suppress persisting the CLI's own new session id. Otherwise
     // the next real user turn resumes from a stale, pre-completion CLI session
-    // and silently loses the image_generate tool result and reply.
-    const sessionKey = "agent:main:direct:image-completion";
+    // and silently loses the image_generate tool result and reply. This needs a
+    // real storePath (like "passes prepared CLI user turns to the runtime
+    // persistence boundary" above) because the binding write commits through
+    // patchSessionEntryCore, unlike the binding-clear path exercised by the
+    // "preserves"/"clears" tests above, which has an in-memory fallback.
     state.isCliProviderMock.mockReturnValue(true);
     state.runWithModelFallbackMock.mockImplementationOnce(async (params: FallbackRunnerParams) => ({
       result: await params.run(
@@ -804,29 +807,36 @@ describe("executeAgentTurn: CLI session routing", () => {
     followupRun.run.provider = "claude-cli";
     followupRun.run.model = "claude-opus-4-8";
     followupRun.run.inputProvenance = { kind: "inter_session", sourceTool: "image_generate" };
-    const sessionEntry = {
-      sessionId: "openclaw-session",
+    const storePath = makeTestSessionStorePath();
+    const sessionEntry: SessionEntry = {
+      sessionId: "session",
+      sessionFile: path.join(path.dirname(storePath), "session.jsonl"),
       updatedAt: 1,
       cliSessionBindings: { "claude-cli": { sessionId: "pre-image-cli-session" } },
       cliSessionIds: { "claude-cli": "pre-image-cli-session" },
       claudeCliSessionId: "pre-image-cli-session",
-    } as SessionEntry;
-    const activeSessionStore = { [sessionKey]: sessionEntry };
+    };
+    await replaceSessionEntry({ sessionKey: "agent:main:main", storePath }, sessionEntry);
+    await replaceSessionEntry({ sessionKey: "main", storePath }, sessionEntry);
+    const activeSessionStore = { main: sessionEntry };
     const executeAgentTurn = await getExecuteAgentTurnForTest();
 
     const result = await executeAgentTurn({
       ...createMinimalRunAgentTurnParams({ followupRun }),
-      sessionKey,
       activeSessionStore,
-      getActiveSessionEntry: () => sessionEntry,
+      storePath,
+      getActiveSessionEntry: () => activeSessionStore.main,
     });
 
     expect(result.kind).toBe("success");
-    expect(sessionEntry.cliSessionBindings?.["claude-cli"]?.sessionId).toBe(
+    // cliSessionBindings is what getCliSessionBinding()/--resume actually reads;
+    // the legacy top-level claudeCliSessionId mirror is left stale by every
+    // "set a new binding" path (only clearing ever touches it) in both the
+    // pre-fix and post-fix code, so it is intentionally not asserted here.
+    expect(activeSessionStore.main.cliSessionBindings?.["claude-cli"]?.sessionId).toBe(
       "post-image-cli-session",
     );
-    expect(sessionEntry.cliSessionIds?.["claude-cli"]).toBe("post-image-cli-session");
-    expect(sessionEntry.claudeCliSessionId).toBe("post-image-cli-session");
+    expect(activeSessionStore.main.cliSessionIds?.["claude-cli"]).toBe("post-image-cli-session");
   });
 
   it("does not attribute media from an earlier admitted turn to a queued failure", async () => {

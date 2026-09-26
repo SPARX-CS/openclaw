@@ -22,7 +22,7 @@ import { withLocalSessionPlacementTurnSettlement } from "../../agents/session-pl
 import { normalizeChatType } from "../../channels/chat-type.js";
 import { loadSessionEntry } from "../../config/sessions/session-accessor.js";
 import { createStructuredOutboundPayloadPlan } from "../../infra/outbound/payloads.js";
-import { shouldPreserveUserFacingSessionStateForInputProvenance } from "../../sessions/input-provenance.js";
+import { shouldPersistCliSessionBindingForInputProvenance } from "../../sessions/input-provenance.js";
 import {
   getGeneratedMediaTaskIdsForSessionKey,
   hasNewGeneratedMediaTaskForSessionKey,
@@ -481,9 +481,7 @@ export async function runCliFallbackCandidate(
         const classification = params.classifyResult(candidateResult);
         if (
           (!classification || candidateResult.meta.agentMeta?.clearCliSessionBinding === true) &&
-          !shouldPreserveUserFacingSessionStateForInputProvenance(
-            turn.followupRun.run.inputProvenance,
-          )
+          shouldPersistCliSessionBindingForInputProvenance(turn.followupRun.run.inputProvenance)
         ) {
           return await persistCliSessionBindingResult({
             agentId: turn.followupRun.run.agentId,
