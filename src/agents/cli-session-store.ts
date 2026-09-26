@@ -98,6 +98,11 @@ export async function persistCliSessionBindingResult(
   params: CliSessionStoreTarget & {
     result: EmbeddedAgentRunResult;
     expectedSession?: InternalSessionEntry;
+    /**
+     * Native ids this publication may replace. A binding published by another
+     * turn after this one started is newer continuity and must not be overwritten.
+     */
+    replaceableCliSessionIds?: ReadonlySet<string | undefined>;
     assertSettlementCurrent: () => void;
     abortSignal?: AbortSignal;
   },
@@ -106,6 +111,7 @@ export async function persistCliSessionBindingResult(
   if (!expectedSession) {
     return params.result;
   }
+  const replaceable = params.replaceableCliSessionIds;
   return await settleCliSessionResult(params.result, async () => {
     await patchCliSessionBindingInStore({
       ...params,
@@ -113,6 +119,8 @@ export async function persistCliSessionBindingResult(
       preserveActivity: true,
       skipMaintenance: true,
       update: (entry) =>
+        (!replaceable ||
+          replaceable.has(getCliSessionBinding(entry, params.provider)?.sessionId)) &&
         applyCliSessionBindingResult(entry, params.provider, params.result.meta.agentMeta),
       assertCommitAllowed: () =>
         assertCliSessionBindingResultCommitAllowed(

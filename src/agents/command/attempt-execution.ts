@@ -241,6 +241,12 @@ export function runAgentAttempt(params: {
   transcriptBody?: string;
   isFallbackRetry: boolean;
   preserveCliSessionBinding?: boolean;
+  /**
+   * A preserved completion turn that could not resume the bound native session
+   * publishes the fresh one, so later completions and the next user turn resume
+   * the conversation that saw the result instead of reseeding again.
+   */
+  publishFreshPreservedCliSessionBinding?: boolean;
   classifyResult?: (result: EmbeddedAgentRunResult) => ModelFallbackResultClassification;
   modelRoutingProvenance: ModelFallbackAttemptProvenance;
   resolvedThinkLevel: ThinkLevel;
@@ -981,6 +987,32 @@ export function runAgentAttempt(params: {
             storePath: params.storePath,
             sessionStore: params.sessionStore,
             expectedSession: params.sessionEntry,
+            assertSettlementCurrent,
+            abortSignal: params.deferredLifecycle?.signal ?? params.opts.abortSignal,
+          });
+        }
+        const freshCliSessionId = result.meta.agentMeta?.cliSessionBinding?.sessionId;
+        if (
+          params.preserveCliSessionBinding &&
+          params.publishFreshPreservedCliSessionBinding &&
+          !classification &&
+          result.meta.agentMeta?.cliSessionContinuity === "fresh" &&
+          result.meta.agentMeta.clearCliSessionBinding !== true &&
+          freshCliSessionId &&
+          freshCliSessionId !== activeCliSessionBinding?.sessionId
+        ) {
+          log.info(
+            `CLI session published from preserved completion turn: provider=${sanitizeForLog(cliExecutionProvider)} sessionKey=${params.sessionKey ?? params.sessionId}`,
+          );
+          return await persistCliSessionBindingResult({
+            agentId: params.sessionAgentId,
+            provider: cliExecutionProvider,
+            result,
+            sessionKey: params.sessionKey,
+            storePath: params.storePath,
+            sessionStore: params.sessionStore,
+            expectedSession: params.sessionEntry,
+            replaceableCliSessionIds: new Set([undefined, activeCliSessionBinding?.sessionId]),
             assertSettlementCurrent,
             abortSignal: params.deferredLifecycle?.signal ?? params.opts.abortSignal,
           });
