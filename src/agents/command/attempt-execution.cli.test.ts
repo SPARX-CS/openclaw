@@ -1277,6 +1277,57 @@ describe("CLI attempt execution", () => {
     },
   );
 
+  it.each([
+    { mainBindingReusable: true, expectedFreshSessions: 0 },
+    { mainBindingReusable: false, expectedFreshSessions: 1 },
+  ])(
+    "runs four image completions with $expectedFreshSessions fresh native sessions (reusable=$mainBindingReusable)",
+    async ({ mainBindingReusable, expectedFreshSessions }) => {
+      const sessionKey = `agent:main:four-image-completions-${mainBindingReusable}`;
+      const sessionEntry = makeSessionEntry(`four-image-completions-${mainBindingReusable}`);
+      sessionEntry.cliSessionBindings = { "claude-cli": { sessionId: "main-native" } };
+      const sessionStore = { [sessionKey]: sessionEntry };
+      await writeSessionStoreSeed(sessionStore);
+      await writeClaudeCliAssistantTranscript("main-native", path.join(tmpDir, "cold-home"));
+      // Emulates the prepare-time reuse decision: the main binding may carry a
+      // fingerprint these completion turns cannot resume; a binding they created can.
+      const resumable = new Set(mainBindingReusable ? ["main-native"] : []);
+      const resumedIds: Array<string | undefined> = [];
+      let freshSessions = 0;
+      runCliAgentMock.mockImplementation(async (run: RunCliAgentParams) => {
+        const resumed = run.cliSessionId !== undefined && resumable.has(run.cliSessionId);
+        resumedIds.push(resumed ? run.cliSessionId : undefined);
+        const nativeId = resumed ? run.cliSessionId! : `completion-native-${++freshSessions}`;
+        resumable.add(nativeId);
+        if (!resumed) {
+          // A real fresh claude-cli session leaves its native transcript behind.
+          await writeClaudeCliAssistantTranscript(nativeId, path.join(tmpDir, "cold-home"));
+        }
+        const result = makeCliResult("image delivered", nativeId);
+        result.meta.agentMeta!.cliSessionContinuity = resumed ? "resumed" : "fresh";
+        return result;
+      });
+
+      for (let image = 1; image <= 4; image += 1) {
+        const current = expectDefined(readSessionStore()[sessionKey], "session row");
+        await runOuterCliFallback({
+          sessionKey,
+          sessionEntry: current,
+          sessionStore: { [sessionKey]: current },
+          runId: `four-image-completion-${mainBindingReusable}-${image}`,
+          suppression: "preserved-state",
+        });
+      }
+
+      expect(runCliAgentMock).toHaveBeenCalledTimes(4);
+      expect(freshSessions).toBe(expectedFreshSessions);
+      expect(resumedIds.filter(Boolean)).toHaveLength(4 - expectedFreshSessions);
+      expect(readSessionStore()[sessionKey]?.cliSessionBindings?.["claude-cli"]?.sessionId).toBe(
+        mainBindingReusable ? "main-native" : "completion-native-1",
+      );
+    },
+  );
+
   it("does not overwrite a binding another turn published while a preserved completion ran", async () => {
     const sessionKey = "agent:main:completion-binding-race";
     const sessionEntry = makeSessionEntry("completion-binding-race");
