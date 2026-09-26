@@ -62,7 +62,7 @@ export type SubagentCompletionDeliveryState = {
   steeringLeasedAt?: number;
   steeringInjectedAt?: number;
   suspendedAt?: number;
-  suspendedReason?: "expiry" | "permanent_failure";
+  suspendedReason?: "expiry" | "permanent_failure" | "retry-limit";
   dismissedAt?: number;
   discardedAt?: number;
   discardReason?: "expired" | "task-missing";

@@ -170,7 +170,7 @@ export function suspendPendingFinalDelivery(
   args: {
     runId: string;
     entry: SubagentRunRecord;
-    reason: "expiry" | "permanent_failure";
+    reason: "expiry" | "permanent_failure" | "retry-limit";
     error?: string;
     storeReplaced?: true;
   },

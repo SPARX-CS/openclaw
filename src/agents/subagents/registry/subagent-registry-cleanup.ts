@@ -8,6 +8,7 @@ import {
   SUBAGENT_ENDED_REASON_COMPLETE,
   type SubagentLifecycleEndedReason,
 } from "./subagent-lifecycle-events.js";
+import { MAX_ANNOUNCE_RETRY_COUNT } from "./subagent-registry-helpers.js";
 import type { SubagentRunRecord } from "./subagent-registry.types.js";
 
 export const shouldSuspendPendingFinalDelivery = (entry: SubagentRunRecord) =>
@@ -22,7 +23,7 @@ type DeferredCleanupDecision =
     }
   | {
       kind: "give-up";
-      reason: "expiry" | "permanent_failure";
+      reason: "expiry" | "permanent_failure" | "retry-limit";
       retryCount?: number;
     }
   | {
@@ -59,6 +60,13 @@ export function resolveDeferredCleanupDecision(params: {
   announceCompletionHardExpiryMs: number;
   deferDescendantDelayMs: number;
   resolveAnnounceRetryDelayMs: (retryCount: number) => number;
+  /**
+   * The pending requester still owns this delivery; the caller only observed
+   * that fact and did not spend a real delivery attempt. Exempt from the
+   * retry-count ceiling so a busy but healthy requester cannot look like a
+   * stuck delivery; the expiry/permanent-failure give-up checks still apply.
+   */
+  isRequesterTurnObservation?: boolean;
 }): DeferredCleanupDecision {
   const isCompletionMessageFlow = params.entry.expectsCompletionMessage === true;
   const expiryMs = isCompletionMessageFlow
@@ -81,6 +89,13 @@ export function resolveDeferredCleanupDecision(params: {
         params.entry.delivery?.disposition === "permanent_failure" ? "permanent_failure" : "expiry",
       retryCount,
     };
+  }
+
+  if (!params.isRequesterTurnObservation && retryCount > MAX_ANNOUNCE_RETRY_COUNT) {
+    // Each retry mints a fresh CLI session and replays the full transcript;
+    // an attempt-count ceiling bounds that cost even while the time-boxed
+    // delivery window has not yet expired.
+    return { kind: "give-up", reason: "retry-limit", retryCount };
   }
 
   const persistedNextAttemptAt = params.entry.delivery?.nextAttemptAt;

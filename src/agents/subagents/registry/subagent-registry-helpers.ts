@@ -32,6 +32,12 @@ import { resolveCompletionFromSessionEntry } from "./subagent-session-reconcilia
 
 export const PROVISIONAL_KILL_RECONCILIATION_MS = 5 * 60_000;
 export const MIN_ANNOUNCE_RETRY_DELAY_MS = 15_000;
+// Each retry mints a fresh CLI session and replays the full transcript, so a
+// stuck delivery must give up on attempt count, not only on the 30-minute hard
+// expiry (incident: unbounded retries on a transient gateway timeout burned
+// provider quota over ~6 minutes). Matches the last known-good production
+// ceiling from v2026.7.1-2 before it was dropped.
+export const MAX_ANNOUNCE_RETRY_COUNT = 3;
 const MAX_ANNOUNCE_RETRY_DELAY_MS = 5 * 60_000;
 const ANNOUNCE_RETRY_JITTER = 0.2;
 export const ANNOUNCE_EXPIRY_MS = 5 * 60_000;
@@ -80,7 +86,7 @@ function formatAnnounceGiveUpLogField(value: string): string {
 /** Logs a sanitized final give-up line for failed subagent announce delivery. */
 export function logAnnounceGiveUp(
   entry: SubagentRunRecord,
-  reason: "expiry" | "permanent_failure",
+  reason: "expiry" | "permanent_failure" | "retry-limit",
 ) {
   const retryCount = getDeliveryAttemptCount(entry);
   const endedAt = entry.execution.endedAt;

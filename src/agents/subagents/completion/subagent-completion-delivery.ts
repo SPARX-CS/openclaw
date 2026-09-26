@@ -99,7 +99,10 @@ export function admitCorrelatedSubagentSessionDelivery(params: {
       idempotencyKey: `${params.payload.idempotencyKey ?? params.payload.messageId}${generationSuffix}`,
       messageId: `${params.payload.messageId}${generationSuffix}`,
       message: CANONICAL_RESULT_PROMPT,
-      maxRetries: Number.MAX_SAFE_INTEGER,
+      // Inherit the shared session-delivery default cap (MAX_SESSION_DELIVERY_RETRIES)
+      // instead of opting out of it. An unbounded maxRetries let a stuck completion
+      // retry forever inside its 30-minute delivery window, each attempt minting a
+      // fresh CLI session and replaying the full transcript.
       owner: {
         kind: "subagent_completion",
         runId: subagent.runId,

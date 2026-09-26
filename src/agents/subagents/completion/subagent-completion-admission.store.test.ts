@@ -796,6 +796,55 @@ describe("atomic subagent completion admission store", () => {
     });
   });
 
+  it("admits correlated completion deliveries under the shared session-delivery retry cap", async () => {
+    // Regression: this queue entry used to hardcode maxRetries:
+    // Number.MAX_SAFE_INTEGER, opting the subagent-completion redrive path out
+    // of the shared cap (MAX_SESSION_DELIVERY_RETRIES = 5) that every other
+    // session-delivery owner gets. Each retry mints a fresh CLI session and
+    // replays the full transcript, so an unbounded cap let a transient failure
+    // retry forever inside the 30-minute delivery window.
+    await withEnvAsync({ OPENCLAW_STATE_DIR: tempDir }, async () => {
+      closeOpenClawStateDatabaseForTest();
+      database = openOpenClawStateDatabase();
+      const input = records();
+      input.subagent.delivery = {
+        status: "pending",
+        generation: 1,
+        windowStartedAt: Date.now(),
+        deadlineAt: Date.now() + 30 * 60_000,
+      };
+      input.task.deliveryStatus = "pending";
+      subagentRuns.set(input.subagent.runId, input.subagent);
+      ensureTaskRegistryReady();
+      publishTaskRecordAfterAtomicStore(input.task);
+      const payload = {
+        kind: "agentTurn" as const,
+        sessionKey: input.task.requesterSessionKey,
+        message: "placeholder",
+        messageId: "completion-retry-cap",
+        idempotencyKey: "completion-retry-cap",
+        route: {
+          channel: "discord",
+          to: "channel:requester",
+          accountId: "primary",
+          chatType: "channel" as const,
+        },
+        expectedMediaUrls: ["https://example.com/result.png"],
+      };
+
+      const admitted = admitCorrelatedSubagentSessionDelivery({
+        runId: input.subagent.runId,
+        payload,
+      });
+      const stored = database.db
+        .prepare("SELECT entry_json FROM delivery_queue_entries WHERE id = ?")
+        .get(admitted.id) as { entry_json: string };
+      const storedEntry = JSON.parse(stored.entry_json) as { maxRetries?: number };
+      expect(storedEntry.maxRetries).toBeUndefined();
+      expect(storedEntry.maxRetries).not.toBe(Number.MAX_SAFE_INTEGER);
+    });
+  });
+
   it("repairs a blocked legacy text completion with Doctor before canonical owner redrive", async () => {
     await withEnvAsync({ OPENCLAW_STATE_DIR: tempDir }, async () => {
       closeOpenClawStateDatabaseForTest();

@@ -25,7 +25,7 @@ export const finalizeResumedAnnounceGiveUp = async (
   giveUpParams: {
     runId: string;
     entry: SubagentRunRecord;
-    reason: "expiry" | "permanent_failure";
+    reason: "expiry" | "permanent_failure" | "retry-limit";
     cleanup?: "delete" | "keep";
     cleanupGeneration?: number;
     retryCount?: number;
