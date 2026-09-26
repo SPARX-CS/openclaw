@@ -773,6 +773,62 @@ describe("executeAgentTurn: CLI session routing", () => {
     expect(sessionEntry.claudeCliSessionId).toBe("aborted-session");
   });
 
+  it("persists a fresh binding after a successful image_generate completion turn", async () => {
+    // image_generate completions preserve user-facing session model/usage state
+    // (cosmetic: they should not look like the user switched models), but that
+    // must not also suppress persisting the CLI's own new session id. Otherwise
+    // the next real user turn resumes from a stale, pre-completion CLI session
+    // and silently loses the image_generate tool result and reply.
+    const sessionKey = "agent:main:direct:image-completion";
+    state.isCliProviderMock.mockReturnValue(true);
+    state.runWithModelFallbackMock.mockImplementationOnce(async (params: FallbackRunnerParams) => ({
+      result: await params.run(
+        "claude-cli",
+        "claude-opus-4-8",
+        initialFallbackAttemptOptions(params),
+      ),
+      provider: "claude-cli",
+      model: "claude-opus-4-8",
+      attempts: [],
+    }));
+    state.runCliAgentMock.mockResolvedValueOnce({
+      payloads: [{ text: "Here is the image you asked for." }],
+      meta: {
+        agentMeta: {
+          cliSessionBinding: { sessionId: "post-image-cli-session" },
+        },
+      },
+    });
+
+    const followupRun = createFollowupRun();
+    followupRun.run.provider = "claude-cli";
+    followupRun.run.model = "claude-opus-4-8";
+    followupRun.run.inputProvenance = { kind: "inter_session", sourceTool: "image_generate" };
+    const sessionEntry = {
+      sessionId: "openclaw-session",
+      updatedAt: 1,
+      cliSessionBindings: { "claude-cli": { sessionId: "pre-image-cli-session" } },
+      cliSessionIds: { "claude-cli": "pre-image-cli-session" },
+      claudeCliSessionId: "pre-image-cli-session",
+    } as SessionEntry;
+    const activeSessionStore = { [sessionKey]: sessionEntry };
+    const executeAgentTurn = await getExecuteAgentTurnForTest();
+
+    const result = await executeAgentTurn({
+      ...createMinimalRunAgentTurnParams({ followupRun }),
+      sessionKey,
+      activeSessionStore,
+      getActiveSessionEntry: () => sessionEntry,
+    });
+
+    expect(result.kind).toBe("success");
+    expect(sessionEntry.cliSessionBindings?.["claude-cli"]?.sessionId).toBe(
+      "post-image-cli-session",
+    );
+    expect(sessionEntry.cliSessionIds?.["claude-cli"]).toBe("post-image-cli-session");
+    expect(sessionEntry.claudeCliSessionId).toBe("post-image-cli-session");
+  });
+
   it("does not attribute media from an earlier admitted turn to a queued failure", async () => {
     const sessionKey = "agent:main:cron:media-job:run:run-queued";
     state.isCliProviderMock.mockReturnValue(true);
