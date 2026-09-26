@@ -3,12 +3,12 @@ import { FailoverError } from "../../failover-error.js";
 import type { FailoverReason } from "../../failover/signal.js";
 import { runAnnounceDeliveryWithRetry } from "./subagent-announce-delivery-retry.js";
 
-function exhaustedFallbackError(reasons: FailoverReason[]): FailoverError {
+function exhaustedFallbackError(reasons: FailoverReason[], message?: string): FailoverError {
   const attempts = reasons.map((reason, index) => ({
     provider: "claude-cli",
     model: `model-${index}`,
     reason,
-    error: `${reason} failure`,
+    error: message ?? `${reason} failure`,
   }));
   return new FailoverError(`All models failed (${attempts.length})`, {
     reason: reasons.at(-1) ?? "unknown",
@@ -52,6 +52,23 @@ describe("runAnnounceDeliveryWithRetry", () => {
       expect(run).toHaveBeenCalledTimes(1);
     },
   );
+
+  it("does not replay the requester turn when every candidate hit a subscription usage limit", async () => {
+    const error = exhaustedFallbackError(
+      ["rate_limit", "rate_limit"],
+      "Claude AI usage limit reached. Your limit will reset at 11pm.",
+    );
+    const { run } = await runWithRejection(error);
+
+    expect(run).toHaveBeenCalledTimes(1);
+  });
+
+  it("retries a short-window rate limit", async () => {
+    const error = exhaustedFallbackError(["rate_limit"], "429 Too Many Requests");
+    const { run } = await runWithRejection(error);
+
+    expect(run).toHaveBeenCalledTimes(4);
+  });
 
   it("retries when a fallback candidate failed transiently", async () => {
     const error = exhaustedFallbackError(["billing", "overloaded"]);

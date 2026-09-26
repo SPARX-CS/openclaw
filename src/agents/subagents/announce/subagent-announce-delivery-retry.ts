@@ -10,8 +10,9 @@ import {
   isPlatformMessageRejectedError,
 } from "../../../infra/outbound/deliver-types.js";
 import { defaultRuntime } from "../../../runtime.js";
-import { isFailoverError } from "../../failover-error.js";
+import { type FallbackAttemptRecord, isFailoverError } from "../../failover-error.js";
 import { shouldUseTransientCooldownProbeSlot } from "../../failover-policy.js";
+import { classifyRateLimitWindow } from "../../failover/retry-evidence.js";
 import type { SubagentAnnounceDeliveryResult } from "./subagent-announce-dispatch.js";
 
 const DEFAULT_SUBAGENT_ANNOUNCE_TIMEOUT_MS = 120_000;
@@ -126,6 +127,16 @@ function hasWriterClaimReboundAnnounceError(error: unknown): boolean {
   return hasAnnounceErrorMatch(error, isWriterClaimReboundAnnounceError);
 }
 
+function canFallbackAttemptClearBeforeAnnounceRetry(attempt: FallbackAttemptRecord): boolean {
+  if (!shouldUseTransientCooldownProbeSlot(attempt.reason)) {
+    return false;
+  }
+  // Subscription usage limits surface as rate_limit; a long window will not
+  // clear within the seconds-scale announce retries. The registry retry owns
+  // later redelivery.
+  return attempt.reason !== "rate_limit" || classifyRateLimitWindow(attempt.error).kind !== "long";
+}
+
 function isTransientFailoverAnnounceError(error: unknown): boolean {
   // Each retry replays a full requester turn. An exhausted fallback chain is worth
   // replaying only when some candidate failed for a reason that can clear soon;
@@ -133,8 +144,7 @@ function isTransientFailoverAnnounceError(error: unknown): boolean {
   return (
     isFailoverError(error) &&
     (error.reason === "overloaded" ||
-      (error.attempts?.some((attempt) => shouldUseTransientCooldownProbeSlot(attempt.reason)) ??
-        false))
+      (error.attempts?.some(canFallbackAttemptClearBeforeAnnounceRetry) ?? false))
   );
 }
 
