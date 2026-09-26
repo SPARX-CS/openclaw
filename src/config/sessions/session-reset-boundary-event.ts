@@ -9,6 +9,8 @@ export type SessionResetBoundaryRequest =
   | {
       context: "preserve-tail";
       reason: Extract<SessionResetBoundaryReason, "reset" | "idle" | "daily" | "cron-stale">;
+      /** Append a session continuity record after the boundary in the same transaction. */
+      continuity?: true;
     };
 
 type SessionResetBoundaryEvent = {

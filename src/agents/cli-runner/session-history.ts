@@ -14,6 +14,10 @@ import {
   waitForSessionTranscriptProjection,
   type SessionTranscriptRuntimeTarget,
 } from "../../config/sessions/session-accessor.js";
+import {
+  isSessionContinuityMessage,
+  SESSION_CONTINUITY_MAX_CHARS,
+} from "../../config/sessions/session-continuity-record.js";
 import { SessionTranscriptStorageUnavailableError } from "../../config/sessions/session-transcript-projection-error.js";
 import { resolveSessionTranscriptReadFence } from "../../config/sessions/session-transcript-read-fence.js";
 import { estimateToolResultTextChars } from "../embedded-agent-runner/tool-result-text-budget.js";
@@ -40,6 +44,8 @@ const CHARS_PER_TOKEN_ESTIMATE = 4;
 const MAX_CLI_SESSION_HISTORY_EVENTS = 10_000;
 const MAX_CLI_DURABLE_CONTEXT_CHARS = 2_000;
 const CLI_DURABLE_CONTEXT_OMISSION = "[Session notes truncated; earlier notes may be omitted.]";
+/** Escaping and the block label may grow a within-budget record slightly. */
+const CLI_CONTINUITY_RENDER_OVERHEAD_CHARS = 2_000;
 
 type CliSessionHistoryParams = {
   abortSignal?: AbortSignal;
@@ -444,7 +450,8 @@ function renderCliDurableContext(messages: ReturnType<typeof buildSessionContext
     if (
       message.role !== "custom" ||
       message.excludeFromContext === true ||
-      isOpenClawRuntimeContextCustomMessage(message)
+      isOpenClawRuntimeContextCustomMessage(message) ||
+      isSessionContinuityMessage(message)
     ) {
       return [];
     }
@@ -486,11 +493,40 @@ function renderCliDurableContext(messages: ReturnType<typeof buildSessionContext
   return selected.length > 0 ? render(selected, false) : undefined;
 }
 
+/**
+ * Renders the newest continuity record of the active reset window. The record is
+ * already bounded and lists its own omissions, so it is never cut here; an
+ * over-budget record is replaced by an explicit retrieval notice instead.
+ */
+function renderCliContinuityContext(
+  messages: ReturnType<typeof buildSessionContext>["messages"],
+): string | undefined {
+  const record = messages.findLast((message) => isSessionContinuityMessage(message));
+  const text = record ? coerceHistoryText((record as { content?: unknown }).content) : "";
+  if (!text) {
+    return undefined;
+  }
+  const label = "Session continuity record (carried across the automatic session reset)";
+  const rendered = wrapUntrustedPromptDataBlock({ label, text });
+  if (rendered.length <= SESSION_CONTINUITY_MAX_CHARS + CLI_CONTINUITY_RENDER_OVERHEAD_CHARS) {
+    return rendered;
+  }
+  return wrapUntrustedPromptDataBlock({
+    label,
+    text: "A continuity record exists for this conversation but exceeded the prompt budget. Retrieve earlier history with sessions_history before continuing prior work; do not guess prior conditions.",
+  });
+}
+
 /** Reads one active branch for bounded reference notes and eligible fresh-session history. */
 export async function loadCliSessionPromptContext(
   params: CliSessionHistoryParams & {
     allowRawTranscriptReseed?: boolean;
     rawTranscriptReseedReason?: RawTranscriptReseedReason;
+    /**
+     * A fresh native CLI session has not seen the continuity record. Resumed
+     * sessions already carry it, so it is not resent on every turn.
+     */
+    freshCliSession?: boolean;
   },
 ) {
   // Summaries and caller-owned history contain the same private context as the raw tail.
@@ -502,7 +538,7 @@ export async function loadCliSessionPromptContext(
     cliBackendLog.warn(
       `cli session history refused across auth boundary: reason=${params.rawTranscriptReseedReason}`,
     );
-    return { reseedMessages: [], durableContext: undefined };
+    return { reseedMessages: [], durableContext: undefined, continuityContext: undefined };
   }
   const entries = await loadCliSessionEntries(params);
   // This freshly loaded branch is reseed-owned; use persistence rather than provider timestamps.
@@ -515,6 +551,9 @@ export async function loadCliSessionPromptContext(
   // CLI bindings have no local-history coverage cursor. Reference notes are
   // bounded at-least-once context, never evidence that a native turn consumed them.
   const durableContext = renderCliDurableContext(historyMessages);
+  const continuityContext = params.freshCliSession
+    ? renderCliContinuityContext(historyMessages)
+    : undefined;
   const summary = historyMessages[0];
   const hasSummary = summary?.role === "compactionSummary" && summary.summary.trim().length > 0;
   if (
@@ -524,7 +563,7 @@ export async function loadCliSessionPromptContext(
       !params.rawTranscriptReseedReason ||
       !RAW_TRANSCRIPT_RESEED_ALLOWED_REASONS.has(params.rawTranscriptReseedReason))
   ) {
-    return { reseedMessages: [], durableContext };
+    return { reseedMessages: [], durableContext, continuityContext };
   }
   const history = historyMessages.filter(
     (message) =>
@@ -546,5 +585,5 @@ export async function loadCliSessionPromptContext(
           isError: message.role === "toolResult" ? message.isError : undefined,
         };
   });
-  return { reseedMessages, durableContext };
+  return { reseedMessages, durableContext, continuityContext };
 }

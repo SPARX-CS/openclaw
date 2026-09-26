@@ -1038,7 +1038,10 @@ async function initSessionStateAttemptLocked(
   const resetBoundary: SessionResetBoundaryRequest | undefined = previousSessionEntry
     ? resetTriggered
       ? { context: "clear", reason: resolveExplicitSessionEndReason(matchedResetTriggerLower) }
-      : { context: "preserve-tail", reason: continuityReason }
+      : continuityReason === "reset"
+        ? { context: "preserve-tail", reason: continuityReason }
+        : // Automatic idle/daily expiry: carry unfinished work into the next window.
+          { context: "preserve-tail", reason: continuityReason, continuity: true }
     : undefined;
   const resetBoundaryAppended = resetBoundary !== undefined;
   let previousSessionMemory: SessionMemoryTranscript | undefined;

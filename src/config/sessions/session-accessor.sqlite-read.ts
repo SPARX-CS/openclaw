@@ -385,6 +385,30 @@ export function loadTranscriptEventsFromDatabase(
   });
 }
 
+/** Full events after the latest reset boundary; the retained transcript before it is not parsed. */
+export function loadTranscriptEventsSinceLatestReset(
+  database: Pick<OpenClawAgentDatabase, "db">,
+  sessionId: string,
+): TranscriptEvent[] {
+  const navigation = executeSqliteQuerySync(
+    database.db,
+    getSessionKysely(database.db)
+      .selectFrom("transcript_events")
+      .select(["seq", transcriptEventResetNavigationSql().as("event_json")])
+      .where("session_id", "=", sessionId)
+      .orderBy("seq", "asc"),
+  ).rows;
+  let afterSeq: number | undefined;
+  for (const row of navigation) {
+    if ((JSON.parse(row.event_json) as { type?: unknown }).type === "reset") {
+      afterSeq = sqliteNumber(row.seq);
+    }
+  }
+  return readTranscriptEventRows(database, sessionId, { afterSeq }).map(
+    (row) => JSON.parse(row.eventJson) as TranscriptEvent,
+  );
+}
+
 export function readTranscriptSnapshot(
   database: OpenClawAgentDatabase,
   sessionId: string,

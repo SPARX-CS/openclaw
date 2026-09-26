@@ -71,7 +71,7 @@ import {
   finalizeSessionEntryMaintenancePlansAfterWriterReleaseBestEffort,
 } from "./session-accessor.sqlite-maintenance.js";
 import { applySessionEntryExactReplacements } from "./session-accessor.sqlite-replacement-projection.js";
-import { appendSessionResetBoundary } from "./session-accessor.sqlite-reset-boundary.js";
+import { appendSessionResetBoundaryForEntry } from "./session-accessor.sqlite-reset-boundary.js";
 import {
   cloneSessionEntry,
   resolveSqliteScope,
@@ -442,11 +442,16 @@ export async function applySessionEntryLifecycleMutation(params: {
         if (sameKeyRemoval && !shouldRemoveSessionEntry(currentEntry, sameKeyRemoval.removal)) {
           throw new Error(`SQLite session entry has stale lifecycle state for ${sessionKey}`);
         }
-        if (resetBoundary && expectedEntry?.sessionId) {
-          const boundaryScope = { ...resolved, sessionId: expectedEntry.sessionId, sessionKey };
-          appendSessionResetBoundary(transactionDb, boundaryScope, expectedEntry, resetBoundary);
-        }
-        writeSessionEntry(transactionDb, sessionKey, entry, {
+        const entryToWrite =
+          resetBoundary && expectedEntry?.sessionId
+            ? appendSessionResetBoundaryForEntry(transactionDb, {
+                scope: { ...resolved, sessionId: expectedEntry.sessionId, sessionKey },
+                previousEntry: expectedEntry,
+                boundary: resetBoundary,
+                nextEntry: entry,
+              })
+            : entry;
+        writeSessionEntry(transactionDb, sessionKey, entryToWrite, {
           allowStoredAliases: params.allowCanonicalRepair === true,
           preserveNodeSuggestions: params.allowCanonicalRepair === true,
           previousEntry: expectedCurrentEntry ?? null,
