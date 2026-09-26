@@ -318,7 +318,7 @@ type BlockSubagentCompletionParams = {
   subagent: SubagentRunRecord;
   taskId: string;
   reason: string;
-  suspendedReason?: "expiry" | "permanent_failure";
+  suspendedReason?: "expiry" | "permanent_failure" | "retry-limit";
   storeReplaced?: true;
   lastDropReason?: NonNullable<SubagentRunRecord["delivery"]>["lastDropReason"];
   disposition?: NonNullable<SubagentRunRecord["delivery"]>["disposition"];

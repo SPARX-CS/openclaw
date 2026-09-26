@@ -125,7 +125,7 @@ export function mockBlockedCompletionDeliveryOwner(
     }: {
       subagent: SubagentRunRecord;
       reason: string;
-      suspendedReason?: "expiry" | "permanent_failure";
+      suspendedReason?: "expiry" | "permanent_failure" | "retry-limit";
       disposition?: NonNullable<SubagentRunRecord["delivery"]>["disposition"];
     }) => {
       subagent.delivery ??= { status: "pending" };

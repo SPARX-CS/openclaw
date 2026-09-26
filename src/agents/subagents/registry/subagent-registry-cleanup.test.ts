@@ -2,6 +2,7 @@
 // completion delivery, descendants, and retry windows are still unresolved.
 import { describe, expect, it } from "vitest";
 import { resolveDeferredCleanupDecision } from "./subagent-registry-cleanup.js";
+import { MAX_ANNOUNCE_RETRY_COUNT } from "./subagent-registry-helpers.js";
 import type { SubagentRunRecord } from "./subagent-registry.types.js";
 
 type EntryOverrides = Omit<Partial<SubagentRunRecord>, "execution"> & { endedAt?: number };
@@ -30,7 +31,10 @@ describe("resolveDeferredCleanupDecision", () => {
       "activeDescendantRuns" | "entry"
     > &
       Partial<
-        Pick<Parameters<typeof resolveDeferredCleanupDecision>[0], "resolveAnnounceRetryDelayMs">
+        Pick<
+          Parameters<typeof resolveDeferredCleanupDecision>[0],
+          "resolveAnnounceRetryDelayMs" | "isRequesterTurnObservation"
+        >
       >,
   ) {
     // Fixed timing keeps expiry and backoff decisions independent from wall
@@ -112,5 +116,56 @@ describe("resolveDeferredCleanupDecision", () => {
     });
 
     expect(decision).toEqual({ kind: "retry", retryCount: 2, resumeDelayMs: 2_000 });
+  });
+
+  it("gives up once the retry count exceeds MAX_ANNOUNCE_RETRY_COUNT", () => {
+    // getDeliveryAttemptCount + 1 == MAX_ANNOUNCE_RETRY_COUNT + 1: over the ceiling.
+    const decision = resolveDecision({
+      entry: makeEntry({
+        expectsCompletionMessage: false,
+        delivery: { status: "pending", attemptCount: MAX_ANNOUNCE_RETRY_COUNT },
+      }),
+      activeDescendantRuns: 0,
+    });
+
+    expect(decision).toEqual({
+      kind: "give-up",
+      reason: "retry-limit",
+      retryCount: MAX_ANNOUNCE_RETRY_COUNT + 1,
+    });
+  });
+
+  it("still retries one attempt short of MAX_ANNOUNCE_RETRY_COUNT", () => {
+    // getDeliveryAttemptCount + 1 == MAX_ANNOUNCE_RETRY_COUNT: at, not over, the ceiling.
+    const decision = resolveDecision({
+      entry: makeEntry({
+        expectsCompletionMessage: false,
+        delivery: { status: "pending", attemptCount: MAX_ANNOUNCE_RETRY_COUNT - 1 },
+      }),
+      activeDescendantRuns: 0,
+      resolveAnnounceRetryDelayMs: (retryCount) => retryCount * 1_000,
+    });
+
+    expect(decision).toEqual({
+      kind: "retry",
+      retryCount: MAX_ANNOUNCE_RETRY_COUNT,
+      resumeDelayMs: MAX_ANNOUNCE_RETRY_COUNT * 1_000,
+    });
+  });
+
+  it("exempts a pending-requester-turn observation from the retry-count ceiling", () => {
+    // Same over-ceiling attemptCount as above, but flagged as an observation:
+    // it must not be charged as a failed attempt and should keep retrying.
+    const decision = resolveDecision({
+      entry: makeEntry({
+        expectsCompletionMessage: true,
+        delivery: { status: "pending", attemptCount: MAX_ANNOUNCE_RETRY_COUNT },
+      }),
+      activeDescendantRuns: 0,
+      resolveAnnounceRetryDelayMs: (retryCount) => retryCount * 1_000,
+      isRequesterTurnObservation: true,
+    });
+
+    expect(decision.kind).toBe("retry");
   });
 });

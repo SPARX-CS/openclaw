@@ -258,6 +258,7 @@ const finalizeSubagentCleanup = async (
   }
 
   const now = Date.now();
+  const requesterTurnPending = announceOutcome === "requester_turn_pending";
   const deferredDecision = resolveDeferredCleanupDecision({
     entry,
     now,
@@ -266,6 +267,7 @@ const finalizeSubagentCleanup = async (
     announceCompletionHardExpiryMs: ANNOUNCE_COMPLETION_HARD_EXPIRY_MS,
     deferDescendantDelayMs: MIN_ANNOUNCE_RETRY_DELAY_MS,
     resolveAnnounceRetryDelayMs,
+    isRequesterTurnObservation: requesterTurnPending,
   });
 
   if (deferredDecision.kind === "defer-descendants") {
@@ -291,7 +293,6 @@ const finalizeSubagentCleanup = async (
     return;
   }
 
-  const requesterTurnPending = announceOutcome === "requester_turn_pending";
   if (!requesterTurnPending) {
     markPendingFinalDelivery({
       entry,

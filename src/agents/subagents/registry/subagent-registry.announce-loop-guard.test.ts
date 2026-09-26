@@ -199,22 +199,8 @@ describe("announce loop guard (#18264)", () => {
     ]);
   });
 
-  test.each([
-    {
-      name: "entries over the former retry budget keep announcing inside the delivery window",
-      outcome: "retryable",
-      attemptCount: 4,
-    },
-    {
-      name: "pending requester turns preserve the failure budget and schedule another observation",
-      outcome: "requester_turn_pending",
-      attemptCount: 3,
-    },
-  ])("$name", async ({ outcome, attemptCount }) => {
-    mocks.runSubagentAnnounceFlow.mockResolvedValue(outcome);
-
-    const now = Date.now();
-    const entry: SubagentRunRecord = {
+  function makeRetryBudgetEntry(now: number): SubagentRunRecord {
+    return {
       runId: "test-retry-budget",
       childSessionKey: "agent:main:subagent:retry-budget",
       requesterSessionKey: "agent:main:main",
@@ -230,6 +216,9 @@ describe("announce loop guard (#18264)", () => {
       expectsCompletionMessage: true,
       delivery: { status: "pending", attemptCount: 3, lastAttemptAt: now - 30_000 },
     };
+  }
+
+  function stubRetryBudgetTask(entry: SubagentRunRecord) {
     vi.spyOn(taskRuntime, "findDetachedTaskRunAsync").mockResolvedValue({
       lookup: "available",
       task: {
@@ -247,32 +236,73 @@ describe("announce loop guard (#18264)", () => {
         createdAt: entry.createdAt,
       },
     });
+  }
+
+  test("entries over the restored retry budget give up instead of announcing forever (#regression)", async () => {
+    mocks.runSubagentAnnounceFlow.mockResolvedValue("retryable");
+
+    const now = Date.now();
+    const entry = makeRetryBudgetEntry(now);
+    stubRetryBudgetTask(entry);
     mocks.loadSubagentRegistryFromSqlite.mockReturnValue(new Map([[entry.runId, entry]]));
 
     hydrateAndActivateRegistry();
+    // Fixture attemptCount 3 -> retryCount 4, which now exceeds MAX_ANNOUNCE_RETRY_COUNT (3):
+    // a single further announce attempt must give up rather than reschedule another one.
     const resumed = await waitForRun(
       entry.runId,
-      (run) =>
-        run.delivery?.attemptCount === attemptCount &&
-        typeof run.delivery.nextAttemptAt === "number",
+      (run) => typeof run.cleanupCompletedAt === "number",
+    );
+
+    expect(mocks.runSubagentAnnounceFlow).toHaveBeenCalledTimes(1);
+    expect(resumed.delivery).toMatchObject({
+      status: "failed",
+      attemptCount: 4,
+      lastError: "retry-limit",
+    });
+  });
+
+  test("pending requester turns preserve the failure budget and schedule another observation, then give up once a real retry exceeds it", async () => {
+    mocks.runSubagentAnnounceFlow.mockResolvedValue("requester_turn_pending");
+
+    const now = Date.now();
+    const entry = makeRetryBudgetEntry(now);
+    stubRetryBudgetTask(entry);
+    mocks.loadSubagentRegistryFromSqlite.mockReturnValue(new Map([[entry.runId, entry]]));
+
+    hydrateAndActivateRegistry();
+    // An observed pending requester turn is not a failed delivery attempt, so it must
+    // not be charged against the retry-count ceiling even though attemptCount (3) is
+    // already at the boundary.
+    const resumed = await waitForRun(
+      entry.runId,
+      (run) => run.delivery?.attemptCount === 3 && typeof run.delivery.nextAttemptAt === "number",
     );
 
     expect(mocks.runSubagentAnnounceFlow).toHaveBeenCalledTimes(1);
     expect(resumed.cleanupCompletedAt).toBeUndefined();
     expect(resumed.delivery).toMatchObject({
       status: "pending",
-      attemptCount,
+      attemptCount: 3,
       windowStartedAt: entry.execution.endedAt,
       deadlineAt: entry.execution.endedAt! + 30 * 60_000,
     });
     expect(resumed.delivery!.nextAttemptAt).toBeGreaterThan(now);
-    if (outcome === "requester_turn_pending") {
-      mocks.runSubagentAnnounceFlow.mockResolvedValue("retryable");
-      await vi.advanceTimersByTimeAsync(resumed.delivery!.nextAttemptAt! - Date.now());
-      const retried = await waitForRun(entry.runId, (run) => run.delivery?.attemptCount === 4);
-      expect(mocks.runSubagentAnnounceFlow).toHaveBeenCalledTimes(2);
-      expect(retried.delivery?.deadlineAt).toBe(entry.execution.endedAt! + 30 * 60_000);
-    }
+
+    // Once the observation resolves into a genuine retry it is charged as attempt 4,
+    // which now exceeds the restored ceiling and must give up instead of looping.
+    mocks.runSubagentAnnounceFlow.mockResolvedValue("retryable");
+    await vi.advanceTimersByTimeAsync(resumed.delivery!.nextAttemptAt! - Date.now());
+    const gaveUp = await waitForRun(
+      entry.runId,
+      (run) => typeof run.cleanupCompletedAt === "number",
+    );
+    expect(mocks.runSubagentAnnounceFlow).toHaveBeenCalledTimes(2);
+    expect(gaveUp.delivery).toMatchObject({
+      status: "failed",
+      attemptCount: 4,
+      lastError: "retry-limit",
+    });
   });
 
   test("expired completion-message entries are still resumed for announce", async () => {
