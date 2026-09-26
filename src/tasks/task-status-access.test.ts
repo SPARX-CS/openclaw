@@ -6,7 +6,9 @@ import {
 import { resetGeneratedMediaTaskActivityForTests } from "./task-runtime.test-helpers.js";
 import {
   buildPendingGeneratedMediaSessionKeySet,
+  getGeneratedMediaTaskIdsForAnySessionKey,
   getGeneratedMediaTaskIdsForSessionKey,
+  hasNewGeneratedMediaTaskForAnySessionKey,
   hasNewGeneratedMediaTaskForSessionKey,
   hasPendingGeneratedMediaTaskForSessionKey,
 } from "./task-status-access.js";
@@ -61,6 +63,29 @@ describe("generated media task snapshots", () => {
       new Set(),
     );
     expect(mocks.listTaskRecords).not.toHaveBeenCalled();
+  });
+
+  it("detects pending media for a plain (non-cron) session key via the any-session-key helper", () => {
+    const directSessionKey = "agent:main:direct:user-1";
+    const tasks = [
+      {
+        taskId: "direct-image",
+        taskKind: "image_generation",
+        requesterSessionKey: directSessionKey,
+        ownerKey: directSessionKey,
+      },
+    ];
+    mocks.listTaskRecords.mockImplementation(() => tasks);
+    const before = getGeneratedMediaTaskIdsForAnySessionKey(directSessionKey);
+
+    expect(hasNewGeneratedMediaTaskForAnySessionKey(directSessionKey, before)).toBe(false);
+    tasks.push({
+      taskId: "direct-video",
+      taskKind: "video_generation",
+      requesterSessionKey: directSessionKey,
+      ownerKey: directSessionKey,
+    });
+    expect(hasNewGeneratedMediaTaskForAnySessionKey(directSessionKey, before)).toBe(true);
   });
 
   it("tracks active media when a detached runtime does not mirror core tasks", () => {

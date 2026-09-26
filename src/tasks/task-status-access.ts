@@ -59,18 +59,42 @@ export function findTaskByRunIdForStatus(runId: string): TaskRecord | undefined 
   return findTaskByRunId(runId);
 }
 
-/** Snapshots generated-media task ids so replay guards stay attempt-local. */
+/** Shared lookup behind both the exact-run and any-session-key snapshot helpers. */
+function collectGeneratedMediaTaskIdsForSessionKey(sessionKey: string): ReadonlySet<string> {
+  const taskIds = listTasksForOwnerOrRequesterSessionKeyForStatus(sessionKey)
+    .filter((task) => GENERATED_MEDIA_TASK_KINDS.has(task.taskKind ?? ""))
+    .map((task) => task.taskId);
+  const latestAdmission = getLatestGeneratedMediaTaskAdmissionIdForSessionKey(sessionKey);
+  return new Set([...taskIds, ...(latestAdmission ? [`run:${latestAdmission}`] : [])]);
+}
+
+/**
+ * Snapshots generated-media task ids so replay guards stay attempt-local.
+ * Cron-run-exact keys only; generic CLI attempt callers use the
+ * `ForAnySessionKey` variants so ordinary channel sessions get the same guard.
+ */
 export function getGeneratedMediaTaskIdsForSessionKey(
   sessionKey: string | undefined,
 ): ReadonlySet<string> {
   if (!sessionKey || !parseCronRunScopeSuffix(sessionKey).runId) {
     return new Set();
   }
-  const taskIds = listTasksForOwnerOrRequesterSessionKeyForStatus(sessionKey)
-    .filter((task) => GENERATED_MEDIA_TASK_KINDS.has(task.taskKind ?? ""))
-    .map((task) => task.taskId);
-  const latestAdmission = getLatestGeneratedMediaTaskAdmissionIdForSessionKey(sessionKey);
-  return new Set([...taskIds, ...(latestAdmission ? [`run:${latestAdmission}`] : [])]);
+  return collectGeneratedMediaTaskIdsForSessionKey(sessionKey);
+}
+
+/**
+ * Same snapshot as `getGeneratedMediaTaskIdsForSessionKey`, but for callers
+ * whose session key is not exclusively cron-run-scoped (ordinary direct,
+ * group, or channel sessions, alongside cron runs). Only a falsy session key
+ * short-circuits; any other non-empty key queries the registry directly.
+ */
+export function getGeneratedMediaTaskIdsForAnySessionKey(
+  sessionKey: string | undefined,
+): ReadonlySet<string> {
+  if (!sessionKey) {
+    return new Set();
+  }
+  return collectGeneratedMediaTaskIdsForSessionKey(sessionKey);
 }
 
 /** Returns whether one attempt admitted generated-media work after its snapshot. */
@@ -79,6 +103,19 @@ export function hasNewGeneratedMediaTaskForSessionKey(
   before: ReadonlySet<string>,
 ): boolean {
   for (const taskId of getGeneratedMediaTaskIdsForSessionKey(sessionKey)) {
+    if (!before.has(taskId)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/** `hasNewGeneratedMediaTaskForSessionKey` counterpart for any session key shape. */
+export function hasNewGeneratedMediaTaskForAnySessionKey(
+  sessionKey: string | undefined,
+  before: ReadonlySet<string>,
+): boolean {
+  for (const taskId of getGeneratedMediaTaskIdsForAnySessionKey(sessionKey)) {
     if (!before.has(taskId)) {
       return true;
     }
