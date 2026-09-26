@@ -183,6 +183,28 @@ export function shouldPreserveUserFacingSessionStateForInputProvenance(value: un
   return sourceTool ? USER_FACING_SESSION_STATE_PRESERVING_SOURCE_TOOLS.has(sourceTool) : false;
 }
 
+// Media-generation completions durably continue the same visible conversation
+// (the user later refers back to the delivered result), unlike the other
+// out-of-band tools above whose "preserve user-facing state" flag exists to
+// hide cosmetic model/usage metadata. They must keep persisting their CLI
+// backend's returned session id so the next turn resumes from the completion,
+// not from a stale pre-completion checkpoint.
+const MEDIA_GENERATION_COMPLETION_SOURCE_TOOLS: ReadonlySet<string> = new Set([
+  "image_generate",
+  "music_generate",
+  "video_generate",
+]);
+
+export function shouldPersistCliSessionBindingForInputProvenance(value: unknown): boolean {
+  if (!shouldPreserveUserFacingSessionStateForInputProvenance(value)) {
+    return true;
+  }
+  const sourceTool = normalizeOptionalString(
+    normalizeInputProvenance(value)?.sourceTool,
+  )?.toLowerCase();
+  return sourceTool ? MEDIA_GENERATION_COMPLETION_SOURCE_TOOLS.has(sourceTool) : false;
+}
+
 export function hasInterSessionUserProvenance(
   message: { role?: unknown; provenance?: unknown } | undefined,
 ): boolean {
