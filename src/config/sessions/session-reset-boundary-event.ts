@@ -22,6 +22,18 @@ type SessionResetBoundaryEvent = {
   firstKeptEntryId?: string;
 };
 
+/**
+ * Rollover without an explicit reset command. Automatic idle/daily expiry carries a
+ * continuity record for the unfinished work; any other stale reason stays a plain reset.
+ */
+export function automaticResetBoundaryRequest(
+  endReason: string | undefined,
+): Extract<SessionResetBoundaryRequest, { context: "preserve-tail" }> {
+  return endReason === "idle" || endReason === "daily"
+    ? { context: "preserve-tail", reason: endReason, continuity: true }
+    : { context: "preserve-tail", reason: "reset" };
+}
+
 function recordId(record: unknown): string | undefined {
   if (!record || typeof record !== "object" || Array.isArray(record)) {
     return undefined;

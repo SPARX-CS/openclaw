@@ -522,11 +522,6 @@ export async function loadCliSessionPromptContext(
   params: CliSessionHistoryParams & {
     allowRawTranscriptReseed?: boolean;
     rawTranscriptReseedReason?: RawTranscriptReseedReason;
-    /**
-     * A fresh native CLI session has not seen the continuity record. Resumed
-     * sessions already carry it, so it is not resent on every turn.
-     */
-    freshCliSession?: boolean;
   },
 ) {
   // Summaries and caller-owned history contain the same private context as the raw tail.
@@ -538,7 +533,7 @@ export async function loadCliSessionPromptContext(
     cliBackendLog.warn(
       `cli session history refused across auth boundary: reason=${params.rawTranscriptReseedReason}`,
     );
-    return { reseedMessages: [], durableContext: undefined, continuityContext: undefined };
+    return { reseedMessages: [], durableContext: undefined };
   }
   const entries = await loadCliSessionEntries(params);
   // This freshly loaded branch is reseed-owned; use persistence rather than provider timestamps.
@@ -550,10 +545,16 @@ export async function loadCliSessionPromptContext(
   const historyMessages = buildSessionContext(entries).messages;
   // CLI bindings have no local-history coverage cursor. Reference notes are
   // bounded at-least-once context, never evidence that a native turn consumed them.
-  const durableContext = renderCliDurableContext(historyMessages);
-  const continuityContext = params.freshCliSession
-    ? renderCliContinuityContext(historyMessages)
-    : undefined;
+  // "session-expired" is the reason recorded while a reusable native session exists.
+  // Only a fresh native session lacks the continuity record; resumed ones carry it.
+  const continuityContext =
+    params.rawTranscriptReseedReason === "session-expired"
+      ? undefined
+      : renderCliContinuityContext(historyMessages);
+  const durableContext =
+    [continuityContext, renderCliDurableContext(historyMessages)]
+      .filter((block): block is string => Boolean(block))
+      .join("\n\n") || undefined;
   const summary = historyMessages[0];
   const hasSummary = summary?.role === "compactionSummary" && summary.summary.trim().length > 0;
   if (
@@ -563,7 +564,7 @@ export async function loadCliSessionPromptContext(
       !params.rawTranscriptReseedReason ||
       !RAW_TRANSCRIPT_RESEED_ALLOWED_REASONS.has(params.rawTranscriptReseedReason))
   ) {
-    return { reseedMessages: [], durableContext, continuityContext };
+    return { reseedMessages: [], durableContext };
   }
   const history = historyMessages.filter(
     (message) =>
@@ -585,5 +586,5 @@ export async function loadCliSessionPromptContext(
           isError: message.role === "toolResult" ? message.isError : undefined,
         };
   });
-  return { reseedMessages, durableContext, continuityContext };
+  return { reseedMessages, durableContext };
 }

@@ -2037,12 +2037,9 @@ async function prepareCliRunContextWithinReadFence(
             sessionTarget: params.sessionTarget,
             allowRawTranscriptReseed,
             rawTranscriptReseedReason,
-            freshCliSession: !reusableCliSessionId,
           });
     const finalizedTranscriptPrompt =
-      (params.finalizePromptForResolvedTools ||
-        sessionPromptContext?.durableContext ||
-        sessionPromptContext?.continuityContext) &&
+      (params.finalizePromptForResolvedTools || sessionPromptContext?.durableContext) &&
       params.transcriptPrompt === undefined
         ? params.prompt
         : params.transcriptPrompt;
@@ -2061,7 +2058,6 @@ async function prepareCliRunContextWithinReadFence(
       try {
         const hookResult = promptBuildHookResult;
         const prependContext = [
-          sessionPromptContext?.continuityContext,
           sessionPromptContext?.durableContext,
           hookResult?.prependContext,
           authorizedPromptBuildResult?.prependContext,
