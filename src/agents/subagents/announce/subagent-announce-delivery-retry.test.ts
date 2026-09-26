@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { createCliOutputFailoverError } from "../../cli-runner/output-error.js";
 import { FailoverError } from "../../failover-error.js";
 import type { FailoverReason } from "../../failover/signal.js";
 import { runAnnounceDeliveryWithRetry } from "./subagent-announce-delivery-retry.js";
@@ -58,6 +59,24 @@ describe("runAnnounceDeliveryWithRetry", () => {
       ["rate_limit", "rate_limit"],
       "Claude AI usage limit reached. Your limit will reset at 11pm.",
     );
+    const { run } = await runWithRejection(error);
+
+    expect(run).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    "You've hit your session limit · resets 3pm (Asia/Tokyo)",
+    "You’ve hit your session limit · resets 3pm (Asia/Tokyo)",
+    "You've hit your limit · resets 5am (UTC)",
+    "You’ve hit your limit · resets 5am (UTC)",
+  ])("does not replay the requester turn after claude-cli reports %s", async (errorText) => {
+    const cliError = createCliOutputFailoverError({
+      output: { text: "", errorText },
+      provider: "claude-cli",
+      model: "claude-opus",
+    });
+    expect(cliError?.reason).toBe("rate_limit");
+    const error = exhaustedFallbackError([cliError?.reason ?? "unknown"], errorText);
     const { run } = await runWithRejection(error);
 
     expect(run).toHaveBeenCalledTimes(1);
