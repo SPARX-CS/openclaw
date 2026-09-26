@@ -59,18 +59,48 @@ export function findTaskByRunIdForStatus(runId: string): TaskRecord | undefined 
   return findTaskByRunId(runId);
 }
 
-/** Snapshots generated-media task ids so replay guards stay attempt-local. */
+/** Shared lookup behind both the exact-run and any-session-key snapshot helpers. */
+function collectGeneratedMediaTaskIdsForSessionKey(sessionKey: string): ReadonlySet<string> {
+  const taskIds = listTasksForOwnerOrRequesterSessionKeyForStatus(sessionKey)
+    .filter((task) => GENERATED_MEDIA_TASK_KINDS.has(task.taskKind ?? ""))
+    .map((task) => task.taskId);
+  const latestAdmission = getLatestGeneratedMediaTaskAdmissionIdForSessionKey(sessionKey);
+  return new Set([...taskIds, ...(latestAdmission ? [`run:${latestAdmission}`] : [])]);
+}
+
+/**
+ * Snapshots generated-media task ids so replay guards stay attempt-local.
+ * Scoped to the exact cron run key (`agent:<id>:cron:<job>:run:<runId>`): a
+ * descendant session key (e.g. a spawned subagent under that run) deliberately
+ * does not inherit the parent run's replay guard, so this returns an empty set,
+ * without querying the registry, for any other session key shape, including a
+ * plain (non-cron) session. Cron-run-scoped callers only; a caller whose
+ * session key is not exclusively cron-scoped (e.g. any ordinary channel
+ * session) must use `getGeneratedMediaTaskIdsForAnySessionKey` instead, or this
+ * guard silently never engages for it.
+ */
 export function getGeneratedMediaTaskIdsForSessionKey(
   sessionKey: string | undefined,
 ): ReadonlySet<string> {
   if (!sessionKey || !parseCronRunScopeSuffix(sessionKey).runId) {
     return new Set();
   }
-  const taskIds = listTasksForOwnerOrRequesterSessionKeyForStatus(sessionKey)
-    .filter((task) => GENERATED_MEDIA_TASK_KINDS.has(task.taskKind ?? ""))
-    .map((task) => task.taskId);
-  const latestAdmission = getLatestGeneratedMediaTaskAdmissionIdForSessionKey(sessionKey);
-  return new Set([...taskIds, ...(latestAdmission ? [`run:${latestAdmission}`] : [])]);
+  return collectGeneratedMediaTaskIdsForSessionKey(sessionKey);
+}
+
+/**
+ * Same snapshot as `getGeneratedMediaTaskIdsForSessionKey`, but for callers
+ * whose session key is not exclusively cron-run-scoped (ordinary direct,
+ * group, or channel sessions, alongside cron runs). Only a falsy session key
+ * short-circuits; any other non-empty key queries the registry directly.
+ */
+export function getGeneratedMediaTaskIdsForAnySessionKey(
+  sessionKey: string | undefined,
+): ReadonlySet<string> {
+  if (!sessionKey) {
+    return new Set();
+  }
+  return collectGeneratedMediaTaskIdsForSessionKey(sessionKey);
 }
 
 /** Returns whether one attempt admitted generated-media work after its snapshot. */
@@ -79,6 +109,19 @@ export function hasNewGeneratedMediaTaskForSessionKey(
   before: ReadonlySet<string>,
 ): boolean {
   for (const taskId of getGeneratedMediaTaskIdsForSessionKey(sessionKey)) {
+    if (!before.has(taskId)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/** `hasNewGeneratedMediaTaskForSessionKey` counterpart for any session key shape. */
+export function hasNewGeneratedMediaTaskForAnySessionKey(
+  sessionKey: string | undefined,
+  before: ReadonlySet<string>,
+): boolean {
+  for (const taskId of getGeneratedMediaTaskIdsForAnySessionKey(sessionKey)) {
     if (!before.has(taskId)) {
       return true;
     }

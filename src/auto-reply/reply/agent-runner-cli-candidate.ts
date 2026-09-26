@@ -24,8 +24,8 @@ import { loadSessionEntry } from "../../config/sessions/session-accessor.js";
 import { createStructuredOutboundPayloadPlan } from "../../infra/outbound/payloads.js";
 import { shouldPreserveUserFacingSessionStateForInputProvenance } from "../../sessions/input-provenance.js";
 import {
-  getGeneratedMediaTaskIdsForSessionKey,
-  hasNewGeneratedMediaTaskForSessionKey,
+  getGeneratedMediaTaskIdsForAnySessionKey,
+  hasNewGeneratedMediaTaskForAnySessionKey,
 } from "../../tasks/task-status-access.js";
 import type { BlockReplyContext, ReplyPayload } from "../types.js";
 import { createAgentLifecycleTerminalBackstop } from "./agent-lifecycle-terminal.js";
@@ -187,7 +187,7 @@ export async function runCliFallbackCandidate(
               config: params.runtimeConfig,
             }).authProfileId;
         const diagnosticOwner = params.deferredLifecycle.handoffToCli();
-        const mediaTaskIdsBefore = getGeneratedMediaTaskIdsForSessionKey(turn.sessionKey);
+        const mediaTaskIdsBefore = getGeneratedMediaTaskIdsForAnySessionKey(turn.sessionKey);
         let droppedCliSessionReplacement = false;
         const candidateResult = await runCliAgentWithLifecycle({
           runId: params.runId,
@@ -205,7 +205,7 @@ export async function runCliFallbackCandidate(
                     !shouldClearFailedCliSessionBinding({
                       error,
                       binding: cliSessionBinding,
-                      hasNewGeneratedMediaTask: hasNewGeneratedMediaTaskForSessionKey(
+                      hasNewGeneratedMediaTask: hasNewGeneratedMediaTaskForAnySessionKey(
                         turn.sessionKey,
                         mediaTaskIdsBefore,
                       ),

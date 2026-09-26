@@ -1648,6 +1648,94 @@ describe("CLI attempt execution", () => {
     expect(persisted[sessionKey]?.cliSessionBindings?.["claude-cli"]?.sessionId).toBe(cliSessionId);
   });
 
+  it("preserves a reused Claude CLI session after detached media starts on a plain direct-message session", async () => {
+    // Regression for the confirmed production incident: a plain (non-cron)
+    // direct-message session key must get the same protection a cron-run
+    // session key already gets above. Before the fix, hasNewGeneratedMediaTask
+    // was always false for this session key shape (getGeneratedMediaTaskIdsForSessionKey
+    // only resolves cron-run-exact keys), so the binding was cleared here every
+    // time, guaranteeing the next handoff/reseed started from scratch.
+    const sessionKey = "agent:main:direct:cli-media-user-1";
+    const cliSessionId = "direct-media-continuation-session";
+    await writeClaudeCliAssistantTranscript(cliSessionId);
+    const sessionEntry = makeClaudeCliSessionEntry("run-id-direct", cliSessionId);
+    const sessionStore = await seedSessionStore(sessionKey, sessionEntry);
+    const abortError = Object.assign(new Error("aborted after media start"), {
+      name: "AbortError",
+    });
+    runCliAgentMock.mockImplementationOnce(async () => {
+      registerGeneratedMediaTaskActivity("tool:image_generate:run-1", sessionKey);
+      throw abortError;
+    });
+
+    await expect(
+      runClaudeCliAttempt({
+        sessionKey,
+        sessionEntry,
+        sessionStore,
+        body: "generate and continue",
+        runId: "run-cli-media-direct",
+      }),
+    ).rejects.toBe(abortError);
+
+    expect(sessionStore[sessionKey]?.cliSessionBindings?.["claude-cli"]?.sessionId).toBe(
+      cliSessionId,
+    );
+    const persisted = readSessionStore();
+    expect(persisted[sessionKey]?.cliSessionBindings?.["claude-cli"]?.sessionId).toBe(cliSessionId);
+  });
+
+  it("does not clear a reused Claude CLI session before a fresh retry when detached media is pending on a plain direct-message session", async () => {
+    // Sharper regression for the same confirmed production incident, isolating
+    // the exact guard: onBeforeFreshCliSessionRetry short-circuits to "keep the
+    // binding" via hasNewGeneratedMediaTaskForAnySessionKey. Before the fix,
+    // this always evaluated false for a plain session key, so the retry hook
+    // fell through to its normal expired-session clearing behavior even while
+    // detached media was pending delivery back into this exact session.
+    const sessionKey = "agent:main:direct:cli-media-retry-user-1";
+    const cliSessionId = "direct-media-retry-session";
+    await writeClaudeCliAssistantTranscript(cliSessionId);
+    const sessionEntry = makeClaudeCliSessionEntry("session-cli-media-retry", cliSessionId);
+    const sessionStore = await seedSessionStore(sessionKey, sessionEntry);
+
+    runCliAgentMock.mockImplementationOnce(async (args: unknown) => {
+      const retry = requireRecord(args, "run CLI agent argument").onBeforeFreshCliSessionRetry;
+      expect(retry).toBeTypeOf("function");
+      registerGeneratedMediaTaskActivity("tool:image_generate:run-1", sessionKey);
+      const cleared = await (
+        retry as (params: {
+          provider: string;
+          reason: "session_expired";
+          sessionId: string;
+        }) => Promise<boolean>
+      )({
+        provider: "claude-cli",
+        reason: "session_expired",
+        sessionId: cliSessionId,
+      });
+      expect(cleared).toBe(false);
+      expect(sessionStore[sessionKey]?.cliSessionBindings?.["claude-cli"]?.sessionId).toBe(
+        cliSessionId,
+      );
+      return makeCliResult("hello from cli", cliSessionId);
+    });
+
+    await runClaudeCliAttempt({
+      sessionEntry,
+      sessionKey,
+      sessionStore,
+      body: "retry this while media is pending",
+      runId: "run-cli-media-retry",
+    });
+
+    expect(runCliAgentMock).toHaveBeenCalledTimes(1);
+    expect(sessionStore[sessionKey]?.cliSessionBindings?.["claude-cli"]?.sessionId).toBe(
+      cliSessionId,
+    );
+    const persisted = readSessionStore();
+    expect(persisted[sessionKey]?.cliSessionBindings?.["claude-cli"]?.sessionId).toBe(cliSessionId);
+  });
+
   it("atomically forks and rebinds a reused Claude CLI session after timeout failover", async () => {
     const sessionKey = "agent:main:direct:cli-timeout";
     const cliSessionId = "timeout-poisoned-session";
