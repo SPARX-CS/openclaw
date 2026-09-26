@@ -11,6 +11,7 @@ import {
 } from "../../../infra/outbound/deliver-types.js";
 import { defaultRuntime } from "../../../runtime.js";
 import { isFailoverError } from "../../failover-error.js";
+import { shouldUseTransientCooldownProbeSlot } from "../../failover-policy.js";
 import { isSessionTranscriptTurnMismatchErrorMessage } from "../../sessions/transcript-turn-error.js";
 
 const DEFAULT_SUBAGENT_ANNOUNCE_TIMEOUT_MS = 120_000;
@@ -115,8 +116,14 @@ function hasWriterClaimReboundAnnounceError(error: unknown): boolean {
 }
 
 function isTransientFailoverAnnounceError(error: unknown): boolean {
+  // Each retry replays a full requester turn. An exhausted fallback chain is worth
+  // replaying only when some candidate failed for a reason that can clear soon;
+  // quota, auth, and model failures would just burn another turn per attempt.
   return (
-    isFailoverError(error) && (error.reason === "overloaded" || (error.attempts?.length ?? 0) > 0)
+    isFailoverError(error) &&
+    (error.reason === "overloaded" ||
+      (error.attempts?.some((attempt) => shouldUseTransientCooldownProbeSlot(attempt.reason)) ??
+        false))
   );
 }
 
