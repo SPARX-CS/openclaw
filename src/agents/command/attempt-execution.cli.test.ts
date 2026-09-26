@@ -15,6 +15,7 @@ import {
   appendTranscriptMessage,
   listSessionEntriesCore,
   loadTranscriptEvents,
+  patchSessionEntryCore,
   replaceSessionEntry,
 } from "../../config/sessions/session-accessor.js";
 import { clearSessionStoreCacheForTest } from "../../config/sessions/store-writer-state.js";
@@ -1237,6 +1238,74 @@ describe("CLI attempt execution", () => {
       cliSessionId: expectedBinding?.sessionId,
       cliSessionBinding: expectedBinding,
     });
+  });
+
+  it.each([
+    { continuity: "fresh", suppression: "preserved-state", expected: "completion-native" },
+    { continuity: "resumed", suppression: "preserved-state", expected: "main-native" },
+    { continuity: "fresh", suppression: "heartbeat", expected: "main-native" },
+  ] as const)(
+    "publishes a preserved completion turn binding only when it started fresh ($continuity, $suppression)",
+    async ({ continuity, suppression, expected }) => {
+      const sessionKey = `agent:main:completion-binding-${continuity}-${suppression}`;
+      const sessionEntry = makeSessionEntry(`completion-binding-${continuity}-${suppression}`);
+      sessionEntry.cliSessionBindings = { "claude-cli": { sessionId: "main-native" } };
+      const sessionStore = { [sessionKey]: sessionEntry };
+      await writeSessionStoreSeed(sessionStore);
+      await writeClaudeCliAssistantTranscript("main-native", path.join(tmpDir, "cold-home"));
+      runCliAgentMock.mockImplementationOnce(async () => {
+        const result = makeCliResult(
+          "image delivered",
+          continuity === "fresh" ? "completion-native" : "main-native",
+        );
+        result.meta.agentMeta!.cliSessionContinuity = continuity;
+        return result;
+      });
+
+      await runOuterCliFallback({
+        sessionKey,
+        sessionEntry,
+        sessionStore,
+        runId: `completion-binding-${continuity}-${suppression}`,
+        suppression,
+      });
+
+      expect(runCliAgentMock).toHaveBeenCalledOnce();
+      expect(readSessionStore()[sessionKey]?.cliSessionBindings?.["claude-cli"]?.sessionId).toBe(
+        expected,
+      );
+    },
+  );
+
+  it("does not overwrite a binding another turn published while a preserved completion ran", async () => {
+    const sessionKey = "agent:main:completion-binding-race";
+    const sessionEntry = makeSessionEntry("completion-binding-race");
+    sessionEntry.cliSessionBindings = { "claude-cli": { sessionId: "main-native" } };
+    const sessionStore = { [sessionKey]: sessionEntry };
+    await writeSessionStoreSeed(sessionStore);
+    await writeClaudeCliAssistantTranscript("main-native", path.join(tmpDir, "cold-home"));
+    runCliAgentMock.mockImplementationOnce(async () => {
+      // A concurrent user turn settles newer continuity before this completion commits.
+      await patchSessionEntryCore({ agentId: "main", sessionKey, storePath }, () => ({
+        cliSessionBindings: { "claude-cli": { sessionId: "user-turn-native" } },
+        cliSessionIds: { "claude-cli": "user-turn-native" },
+      }));
+      const result = makeCliResult("image delivered", "completion-native");
+      result.meta.agentMeta!.cliSessionContinuity = "fresh";
+      return result;
+    });
+
+    await runOuterCliFallback({
+      sessionKey,
+      sessionEntry,
+      sessionStore,
+      runId: "completion-binding-race",
+      suppression: "preserved-state",
+    });
+
+    expect(readSessionStore()[sessionKey]?.cliSessionBindings?.["claude-cli"]?.sessionId).toBe(
+      "user-turn-native",
+    );
   });
 
   it("retains rejected-clear CLI output without replay when continuity settlement loses its owner", async () => {

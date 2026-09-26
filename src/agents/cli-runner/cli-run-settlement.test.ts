@@ -15,6 +15,7 @@ import {
   buildCliDeliveredFailure,
   buildCliRunResult,
 } from "./cli-run-settlement.js";
+import type { CliReusableSession } from "./types.js";
 
 vi.mock("../../plugins/hook-runner-global.js", () => ({
   getGlobalHookRunner: () => ({
@@ -194,6 +195,30 @@ describe("CLI native continuity projection", () => {
       );
     },
   );
+});
+
+it.each([
+  [{ mode: "reuse", sessionId: "main-native" }, "resumed"],
+  [
+    { mode: "reuse-with-drift", sessionId: "main-native", drift: { reasons: ["system-prompt"] } },
+    "resumed",
+  ],
+  [{ mode: "none" }, "fresh"],
+  [{ mode: "invalidate", invalidatedReason: "message-policy" }, "fresh"],
+] as const)("reports whether the turn resumed the bound native session (%j)", (reuse, expected) => {
+  const context = buildPreparedCliRunContext({ provider: "claude-cli" });
+  context.reusableCliSession = structuredClone(reuse) as CliReusableSession;
+  const result = buildCliRunResult({
+    context,
+    output: { text: "done" },
+    effectiveCliSessionId: "next-native-session",
+    bindingFlushOk: true,
+    usedHistoryPrompt: expected === "fresh",
+    userTurnHandled: true,
+    sessionBindingDisabled: false,
+    preparedContextAgentMeta: {},
+  });
+  expect(result.meta.agentMeta?.cliSessionContinuity).toBe(expected);
 });
 
 describe.each(["anthropic", undefined])(

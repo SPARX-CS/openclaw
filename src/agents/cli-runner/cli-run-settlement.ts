@@ -588,6 +588,9 @@ export function buildCliRunResult(params: {
         usage: output.usage,
         ...(output.usage ? { lastCallUsage: output.usage } : {}),
         ...(output.diagnosticUsage ? { diagnosticUsage: output.diagnosticUsage } : {}),
+        cliSessionContinuity: resolveCliSessionId(context.reusableCliSession)
+          ? ("resumed" as const)
+          : ("fresh" as const),
         ...(persistedCliSessionId
           ? {
               cliSessionBinding: {
