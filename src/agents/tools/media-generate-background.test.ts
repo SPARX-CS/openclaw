@@ -285,6 +285,40 @@ describe("music generate background helpers", () => {
     },
   );
 
+  it("asks the requester session to check generated images against the source before relaying", async () => {
+    announceDeliveryMocks.deliverSubagentAnnouncement.mockResolvedValue({
+      delivered: true,
+      path: "direct",
+    });
+    await imageGenerationTaskLifecycle.wakeTaskCompletion({
+      ...createMediaCompletionFixture({
+        runId: "tool:image_generate:page-8",
+        taskLabel: "brochure page 8",
+        result: "Generated 1 image.",
+      }),
+      attachments: [
+        { type: "image", path: "/tmp/page-8.png", mimeType: "image/png", name: "page-8.png" },
+      ],
+    });
+
+    const imageInstruction = String(getDeliveredInternalEvents().at(0)?.replyInstruction);
+    expect(imageInstruction).toContain("open each generated image file listed in this event");
+    expect(imageInstruction).toContain("source material in this conversation");
+    expect(imageInstruction).toContain("every structured generated attachment from this event");
+
+    announceDeliveryMocks.deliverSubagentAnnouncement.mockClear();
+    await musicGenerationTaskLifecycle.wakeTaskCompletion(
+      createMediaCompletionFixture({
+        runId: "tool:music_generate:track",
+        taskLabel: "track",
+        result: "Generated a track.",
+      }),
+    );
+    expect(String(getDeliveredInternalEvents().at(0)?.replyInstruction)).not.toContain(
+      "open each generated image file",
+    );
+  });
+
   it("keeps failed completion notices in the durable agent-loop handoff", async () => {
     announceDeliveryMocks.deliverSubagentAnnouncement.mockResolvedValue({
       delivered: false,

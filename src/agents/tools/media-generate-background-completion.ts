@@ -54,13 +54,20 @@ export function retainBlockedMediaReferences(
   };
 }
 
+// Generated images can silently swap content (photo vs. heading, page order). The
+// requester session holds the source material, so it checks the files before relaying.
+const IMAGE_SOURCE_CHECK_INSTRUCTION =
+  "Before relaying, open each generated image file listed in this event and compare it with the original request and the source material in this conversation (text, names, numbers, which photo or heading belongs where). If an image does not match, tell the user exactly what is wrong instead of presenting it as correct, and fix it or ask; never guess.";
+
 function buildMediaGenerationReplyInstruction(params: {
   status: "ok" | "error";
   completionLabel: string;
+  checkAgainstSource?: boolean;
 }) {
   if (params.status === "ok") {
     return [
       `The ${params.completionLabel} is ready for the original chat.`,
+      ...(params.checkAgainstSource ? [IMAGE_SOURCE_CHECK_INSTRUCTION] : []),
       "Follow the current visible-reply contract with a short user-facing caption and every structured generated attachment from this event.",
       "Keep internal task/session details private and do not copy the internal event text verbatim.",
     ].join(" ");
@@ -113,6 +120,7 @@ export async function wakeMediaGenerationTaskCompletion(params: {
       replyInstruction: buildMediaGenerationReplyInstruction({
         status: params.status,
         completionLabel: params.completionLabel,
+        checkAgainstSource: params.toolName === "image_generate",
       }),
     },
   ];
