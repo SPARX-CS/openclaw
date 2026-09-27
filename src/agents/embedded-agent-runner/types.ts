@@ -67,6 +67,11 @@ export type EmbeddedAgentMeta = {
   fallbackAttempts?: FallbackAttempt[];
   cliSessionBinding?: CliSessionBinding;
   clearCliSessionBinding?: boolean;
+  /**
+   * How this CLI turn used the stored native binding. `resumed` continued the
+   * bound native session; `fresh` started a new one (no binding or invalidated).
+   */
+  cliSessionContinuity?: "resumed" | "fresh";
   compactionCount?: number;
   /**
    * Token count estimate after the most recent successful auto-compaction.
