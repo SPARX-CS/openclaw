@@ -43,6 +43,10 @@ const PRE_DISPATCH_TOOL_CALL_REJECTION_MESSAGES = new Set([
 export function isPreDispatchToolCallRejectionMessage(errorMessage?: string): boolean {
   return errorMessage !== undefined && PRE_DISPATCH_TOOL_CALL_REJECTION_MESSAGES.has(errorMessage);
 }
+// Claude subscription notices: "You've hit your [session ]limit · resets 3pm (UTC)".
+// The middle-dot reset suffix keeps ordinary prose about limits out.
+export const CLAUDE_SUBSCRIPTION_LIMIT_RE =
+  /\byou(?:'|\u2019)ve hit your (?:[a-z]+ )?limit\s*\u00b7\s*resets\b/i;
 const PERIODIC_USAGE_LIMIT_RE =
   /\b(?:daily|weekly|monthly)(?:\/(?:daily|weekly|monthly))* (?:usage )?limit(?:s)?(?: (?:exhausted|reached|exceeded))?\b/i;
 
@@ -122,6 +126,7 @@ const ERROR_PATTERNS = {
     /\bresource[_ -]?exhausted\b/i,
     /\bquota[_ -]?exceeded\b/i,
     "usage limit",
+    CLAUDE_SUBSCRIPTION_LIMIT_RE,
     /\btpm\b/i,
     "tokens per minute",
     "tokens per day",
