@@ -18,6 +18,7 @@
  * Latin proper-noun rule because English capitalizes them regardless of role;
  * a colon does not start a sentence, so "Customer: Smith" still checks Smith.
  */
+import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import type { MemoryArtifactSourceRef } from "./memory-artifact-provenance.js";
 
 export type MemoryWriteSourceRef = MemoryArtifactSourceRef;
@@ -390,9 +391,7 @@ function contentText(content: unknown): string[] {
     return [];
   }
   return content.flatMap((part) =>
-    part && typeof part === "object" && (part as { type?: unknown }).type === "text"
-      ? [String((part as { text?: unknown }).text ?? "")]
-      : [],
+    isRecord(part) && part.type === "text" ? [String(part.text ?? "")] : [],
   );
 }
 
@@ -406,10 +405,10 @@ function contentText(content: unknown): string[] {
 export function renderMemoryWriteSourceMessages(messages: readonly unknown[]): string {
   const parts: string[] = [];
   for (const raw of messages) {
-    if (!raw || typeof raw !== "object") {
+    if (!isRecord(raw)) {
       continue;
     }
-    const message = raw as SourceMessage;
+    const message: SourceMessage = raw;
     if (message.role === "user") {
       parts.push(...contentText(message.content));
     } else if (message.role === "toolResult" && message.isError !== true) {

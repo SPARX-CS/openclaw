@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { realpathSync } from "node:fs";
 import path from "node:path";
+import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import { isMissingPathError } from "../infra/errors.js";
 import { createCorePluginStateKeyedStore } from "../plugin-state/plugin-state-store.js";
 
@@ -146,14 +147,11 @@ function toPublicProvenance(stored: StoredMemoryArtifactProvenance): MemoryArtif
 }
 
 function isWriteVerification(value: unknown): value is MemoryArtifactWriteVerification {
-  if (!value || typeof value !== "object") {
-    return false;
-  }
-  const candidate = value as Partial<MemoryArtifactWriteVerification>;
   return (
-    typeof candidate.gate === "string" &&
-    Number.isSafeInteger(candidate.checkedLines) &&
-    Array.isArray(candidate.sourceRefs)
+    isRecord(value) &&
+    typeof value.gate === "string" &&
+    Number.isSafeInteger(value.checkedLines) &&
+    Array.isArray(value.sourceRefs)
   );
 }
 
