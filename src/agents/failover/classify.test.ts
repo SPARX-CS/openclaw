@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { classifyFailoverReason, classifyFailoverSignal } from "./classify.js";
+import { classifyRateLimitWindow } from "./retry-evidence.js";
 
 describe("HTTP 402 prose classification", () => {
   it.each([
@@ -206,5 +207,26 @@ describe("HTTP 5xx status classification", () => {
         message: '{"error":{"type":"overloaded_error","message":"Overloaded"}}',
       }),
     ).toEqual({ kind: "reason", reason: "overloaded" });
+  });
+});
+
+describe("Claude subscription limit notices", () => {
+  it.each([
+    "You've hit your session limit · resets 3pm (Asia/Tokyo)",
+    "You’ve hit your session limit · resets 3pm (Asia/Tokyo)",
+    "You've hit your limit · resets 5am (UTC)",
+    "You’ve hit your limit · resets 5am (UTC)",
+  ])("classifies %s as a long-window rate limit", (message) => {
+    expect(classifyFailoverReason(message, { provider: "claude-cli" })).toBe("rate_limit");
+    expect(classifyRateLimitWindow(message).kind).toBe("long");
+  });
+
+  it.each([
+    "Your session limit resets at 3pm, so plan the migration before then.",
+    "I think you've hit your limit on coffee today.",
+    "The retry limit resets after each deploy · see the runbook",
+  ])("leaves ordinary text mentioning a limit unclassified: %s", (message) => {
+    expect(classifyFailoverReason(message, { provider: "claude-cli" })).toBeNull();
+    expect(classifyRateLimitWindow(message).kind).toBe("unknown");
   });
 });
