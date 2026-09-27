@@ -24,7 +24,6 @@ import {
   loadTranscriptEvents,
   replaceSessionEntrySync,
 } from "../../config/sessions/session-accessor.js";
-import { SESSION_CONTINUITY_CUSTOM_TYPE } from "../../config/sessions/session-continuity-record.js";
 import { initSessionState } from "./test/session.test-support.js";
 
 vi.mock("../../plugins/hook-runner-global.js", () => ({
@@ -191,7 +190,7 @@ describe("session continuity across the automatic idle reset", () => {
     >;
     return {
       events,
-      records: events.filter((event) => event.customType === SESSION_CONTINUITY_CUSTOM_TYPE),
+      records: events.filter((event) => event.customType === "openclaw.session-continuity"),
       resets: events.filter((event) => event.type === "reset"),
     };
   }

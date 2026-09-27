@@ -5,10 +5,11 @@
 // context-participating custom message directly after the reset boundary, inside the
 // same guarded write transaction, so the reset and its record commit or fail together.
 import { randomUUID } from "node:crypto";
+import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import { selectSessionTranscriptLeafControlledPath } from "./transcript-tree.js";
 
-export const SESSION_CONTINUITY_CUSTOM_TYPE = "openclaw.session-continuity";
-export const SESSION_CONTINUITY_RECORD_VERSION = 1;
+const SESSION_CONTINUITY_CUSTOM_TYPE = "openclaw.session-continuity";
+const SESSION_CONTINUITY_RECORD_VERSION = 1;
 
 /** Rendered record budget. Items that do not fit are listed as omitted, never silently cut. */
 export const SESSION_CONTINUITY_MAX_CHARS = 8_000;
@@ -19,27 +20,23 @@ const MAX_ANCHORS = 12;
 
 type Json = Record<string, unknown>;
 
-export type SessionContinuityRequestStatus =
-  | "unanswered"
-  | "interrupted"
-  | "tool-pending"
-  | "replied";
+type SessionContinuityRequestStatus = "unanswered" | "interrupted" | "tool-pending" | "replied";
 
-export type SessionContinuityRequest = {
+type SessionContinuityRequest = {
   entryId: string;
   timestamp: string;
   text: string;
   status: SessionContinuityRequestStatus;
 };
 
-export type SessionContinuityDeliverable = {
+type SessionContinuityDeliverable = {
   entryId: string;
   tool: string;
   locations: string[];
   outcome: "ok" | "error" | "no-result";
 };
 
-export type SessionContinuityDetails = {
+type SessionContinuityDetails = {
   version: typeof SESSION_CONTINUITY_RECORD_VERSION;
   reason: string;
   sessionId: string;
@@ -57,7 +54,7 @@ export type SessionContinuityDetails = {
   unavailable?: string;
 };
 
-export type SessionContinuityEntry = {
+type SessionContinuityEntry = {
   type: "custom_message";
   customType: typeof SESSION_CONTINUITY_CUSTOM_TYPE;
   id: string;
@@ -74,10 +71,6 @@ const READ_ONLY_TOOL =
   /^(read|glob|grep|ls|list|search|web_search|web_fetch|fetch|sessions_history|sessions_list|memory_search|memory_get|image_describe|view)$/i;
 const LOCATION_KEY =
   /^(path|file_?path|file|filename|output_?path|out|dest|destination|target|to|url|link|folder_?id|drive_?folder_?id|channel|chat_?id|thread_?id|media_?url|saved_?path|file_?url|web_?view_?link|job_?id)$/i;
-
-function isRecord(value: unknown): value is Json {
-  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
-}
 
 function entryId(entry: unknown): string | undefined {
   const id = isRecord(entry) ? entry.id : undefined;
