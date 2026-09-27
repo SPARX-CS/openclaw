@@ -9,7 +9,6 @@ import { messageToolOwnsVisibleReply } from "../auto-reply/source-reply-delivery
 import { resolveEventSessionRoutingPolicy } from "../infra/event-session-routing.js";
 import { mergeGatewayAgentCliPath } from "../infra/openclaw-cli-shim.js";
 import { logWarn } from "../logger.js";
-import { renderMemoryWriteSourceMessages } from "../memory/memory-write-gate.js";
 import type { PluginHookToolRequesterContext } from "../plugins/hook-types.js";
 import { appendRuntimePluginToolGrant } from "../plugins/tool-grant-allowlist.js";
 import { getPluginToolMeta } from "../plugins/tool-metadata.js";
@@ -30,6 +29,7 @@ import {
   messageProviderExcludesTool,
 } from "./agent-tools.message-provider-policy.js";
 import { applyModelProviderToolPolicy } from "./agent-tools.model-provider-policy.js";
+import { createAgentMemoryWriteObserver } from "./agent-tools.memory-write.js";
 import type { OpenClawCodingToolsOptions } from "./agent-tools.options.js";
 import { wrapToolMemoryFlushAppendOnlyWrite } from "./agent-tools.read.js";
 import {
@@ -55,12 +55,10 @@ import { prepareGitHubToolEnvironment } from "./github-tool-identity.js";
 import { resolveImageSanitizationLimits } from "./image-sanitization.js";
 import { resolveExecToolConfig } from "./lazy-exec-tool.js";
 import { resolveLocalModelLeanPreserveToolNames } from "./local-model-lean.js";
-import { createMemoryWriteProvenanceObserver } from "./memory-write-provenance.js";
 import { resolveOpenClawPluginToolsForOptions } from "./openclaw-plugin-tools.js";
 import { createOpenClawTools, filterToolsByClientCaps } from "./openclaw-tools.js";
 import { filterRequesterYieldTools } from "./openclaw-tools.requester-yield.js";
 import { applySwarmCollectorToolContract } from "./openclaw-tools.swarm.js";
-import { resolveSandboxFileIdentity } from "./sandbox/file-mutation-identity.js";
 import { createEmbeddedMessageInvocationPolicy } from "./scheduled-message-invocation.js";
 import { resolveScheduledToolCallerContext } from "./scheduled-tool-policy.js";
 import {
@@ -253,42 +251,11 @@ export function createOpenClawCodingToolsInternal(
   const codingRoot = sandboxRoot ?? runtimeRoot;
   const containmentRoot = sandboxRoot ?? sessionPermissionPolicy?.root ?? codingRoot;
   const memoryFlushWriteRoot = sandboxRoot ?? workspaceRoot;
-  const memoryWriteProvenance = createMemoryWriteProvenanceObserver({
-    mutationRoot: sandboxRoot ?? workspaceRoot,
-    workspaceDir: sandboxRoot ?? workspaceRoot,
-    resolvePath: sandboxFsBridge
-      ? (filePath) =>
-          resolveSandboxFileIdentity({
-            bridge: sandboxFsBridge,
-            filePath,
-            cwd: sandboxRoot,
-            signal: options?.abortSignal,
-          })
-      : undefined,
-    resolveOriginClass: () =>
-      options?.senderIsOwner === false || options?.isTurnTainted?.() === true
-        ? "untrusted"
-        : "agent",
-    sessionId: options?.sessionId,
-    sessionKey: options?.runSessionKey ?? options?.sessionKey,
-    // Memory files (MEMORY.md, memory/*.md, USER.md) only accept lines the
-    // current session transcript supports; see src/memory/memory-write-gate.ts.
-    writeGate: {
-      requireRefKind: "session-transcript",
-      resolveSources: () => {
-        const sessionId = options?.sessionId;
-        const messages = options?.resolveMemoryWriteSourceMessages?.();
-        if (!sessionId || !messages) {
-          return [];
-        }
-        return [
-          {
-            ref: { kind: "session-transcript", sessionId, messageCount: messages.length },
-            text: renderMemoryWriteSourceMessages(messages),
-          },
-        ];
-      },
-    },
+  const memoryWriteProvenance = createAgentMemoryWriteObserver({
+    options,
+    root: sandboxRoot ?? workspaceRoot,
+    sandboxRoot,
+    sandboxFsBridge,
   });
   const includeCoreTools = options?.includeCoreTools !== false;
   const toolConstructionPlan = options?.toolConstructionPlan ?? {
