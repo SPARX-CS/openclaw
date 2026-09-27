@@ -400,11 +400,13 @@ export function loadTranscriptEventsSinceLatestReset(
   ).rows;
   let afterSeq: number | undefined;
   for (const row of navigation) {
-    if ((JSON.parse(row.event_json) as { type?: unknown }).type === "reset") {
+    const navigationEvent: unknown = JSON.parse(row.event_json);
+    if (isRecord(navigationEvent) && navigationEvent.type === "reset") {
       afterSeq = sqliteNumber(row.seq);
     }
   }
   return readTranscriptEventRows(database, sessionId, { afterSeq }).map(
+    // SAFETY: transcript_events.event_json always holds one serialized TranscriptEvent.
     (row) => JSON.parse(row.eventJson) as TranscriptEvent,
   );
 }

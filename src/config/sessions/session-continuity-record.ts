@@ -114,25 +114,26 @@ function quote(text: string): string {
 }
 
 /** Active branch, from the latest earlier boundary (exclusive) to the transcript leaf. */
-function selectPreResetWindow(events: readonly unknown[]): unknown[] {
+function selectPreResetWindow(events: readonly unknown[]): Json[] {
   const entries = events.filter(
-    (event) => isRecord(event) && event.type !== "session" && entryId(event),
+    (event): event is Json =>
+      isRecord(event) && event.type !== "session" && Boolean(entryId(event)),
   );
   let path = selectSessionTranscriptLeafControlledPath(entries);
   if (!path) {
     const byId = new Map(entries.map((entry) => [entryId(entry)!, entry]));
     path = [];
     const seen = new Set<string>();
-    let current: unknown = entries.at(-1);
+    let current = entries.at(-1);
     while (current && !seen.has(entryId(current)!)) {
       seen.add(entryId(current)!);
       path.push(current);
-      const parentId = (current as Json).parentId;
+      const parentId = current.parentId;
       current = typeof parentId === "string" ? byId.get(parentId) : undefined;
     }
     path.reverse();
   }
-  const lastReset = path.findLastIndex((entry) => (entry as Json).type === "reset");
+  const lastReset = path.findLastIndex((entry) => entry.type === "reset");
   return path.slice(lastReset + 1);
 }
 
@@ -162,20 +163,19 @@ type WindowFacts = {
   compactionEntryIds: string[];
 };
 
-function readWindowFacts(window: readonly unknown[]): WindowFacts {
+function readWindowFacts(window: readonly Json[]): WindowFacts {
   const userMessages: WindowFacts["userMessages"] = [];
   const deliverables: SessionContinuityDeliverable[] = [];
   const compactionEntryIds: string[] = [];
   const pendingCalls = new Map<
     string,
-    SessionContinuityDeliverable & { locationSet: Set<string> }
+    { deliverable: SessionContinuityDeliverable; locationSet: Set<string> }
   >();
   // Per user turn: last assistant stop reason and unresolved tool calls.
   // Consecutive user messages form one turn and share its outcome.
   const turns: Array<{ lastStop?: string; openCalls: Set<string>; activity: boolean }> = [];
   const turnOfUser: number[] = [];
-  window.forEach((entry, index) => {
-    const record = entry as Json;
+  window.forEach((record, index) => {
     const id = entryId(record)!;
     const timestamp = typeof record.timestamp === "string" ? record.timestamp : "";
     if (record.type === "compaction") {
@@ -219,30 +219,28 @@ function readWindowFacts(window: readonly unknown[]): WindowFacts {
         }
         const locationSet = new Set<string>();
         collectLocations(block.arguments, locationSet);
-        const deliverable = {
+        const deliverable: SessionContinuityDeliverable = {
           entryId: id,
           tool: block.name,
           locations: [],
-          outcome: "no-result" as const,
-          locationSet,
+          outcome: "no-result",
         };
-        pendingCalls.set(callId, deliverable);
+        pendingCalls.set(callId, { deliverable, locationSet });
         deliverables.push(deliverable);
       }
       return;
     }
     if (message.role === "toolResult" && typeof message.toolCallId === "string") {
       turn?.openCalls.delete(message.toolCallId);
-      const deliverable = pendingCalls.get(message.toolCallId);
-      if (deliverable) {
-        deliverable.outcome = message.isError === true ? "error" : "ok";
-        collectLocations(message.details, deliverable.locationSet);
+      const pending = pendingCalls.get(message.toolCallId);
+      if (pending) {
+        pending.deliverable.outcome = message.isError === true ? "error" : "ok";
+        collectLocations(message.details, pending.locationSet);
       }
     }
   });
-  for (const deliverable of pendingCalls.values()) {
-    deliverable.locations = [...deliverable.locationSet];
-    delete (deliverable as Partial<typeof deliverable>).locationSet;
+  for (const { deliverable, locationSet } of pendingCalls.values()) {
+    deliverable.locations = [...locationSet];
   }
   const requests = userMessages.map((user, userIndex): SessionContinuityRequest => {
     const turn = turns[turnOfUser[userIndex]!]!;

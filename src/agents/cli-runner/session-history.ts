@@ -502,7 +502,7 @@ function renderCliContinuityContext(
   messages: ReturnType<typeof buildSessionContext>["messages"],
 ): string | undefined {
   const record = messages.findLast((message) => isSessionContinuityMessage(message));
-  const text = record ? coerceHistoryText((record as { content?: unknown }).content) : "";
+  const text = record && "content" in record ? coerceHistoryText(record.content) : "";
   if (!text) {
     return undefined;
   }
