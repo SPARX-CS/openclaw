@@ -21,6 +21,7 @@ import type { OpenClawConfig } from "../../../config/types.openclaw.js";
 import { isVitestRuntimeEnv } from "../../../infra/env.js";
 import { root } from "../../../infra/fs-safe.js";
 import { createSubsystemLogger } from "../../../logging/subsystem.js";
+import { MemoryWriteGateError, type MemoryWriteSource } from "../../../memory/memory-write-gate.js";
 import { runWithGatewayIndependentRootWorkContinuation } from "../../../process/gateway-work-admission.js";
 import { parseAgentSessionKey, toAgentStoreSessionKey } from "../../../routing/session-key.js";
 import { shortenHomePath } from "../../../utils.js";
@@ -250,6 +251,39 @@ async function saveSessionMemoryNow(
 
     const entry = entryParts.join("\n");
 
+    // The memory write gate refuses unreferenced claims. An automatic write
+    // without a session to reference is skipped with a diagnostic instead.
+    if (!currentSessionId) {
+      log.warn("Session memory write skipped: no session id to reference as the memory source", {
+        sessionKey: event.sessionKey,
+      });
+      return;
+    }
+    const sessionMemorySources: MemoryWriteSource[] = [
+      {
+        ref: { kind: "session-transcript", sessionId: currentSessionId },
+        text:
+          transcript.status === "available" && transcript.content
+            ? transcript.content
+            : currentSessionId,
+      },
+      {
+        // Hook-generated header facts, taken from the event rather than the model.
+        ref: { kind: "hook-metadata", label: "session-memory" },
+        text: [
+          "Session Key",
+          "Session ID",
+          dateStr,
+          timeStr,
+          userTimezone,
+          displaySessionKey,
+          sessionId,
+          boundaryDetail,
+          transcript.status === "unavailable" ? JSON.stringify(transcript.reason) : "",
+        ].join("\n"),
+      },
+    ];
+
     // Reserve provenance before exposing the file. A restricted projection
     // must never fall back to an untracked artifact that later reads as trusted.
     const memoryRoot = await root(memoryDir);
@@ -261,6 +295,10 @@ async function saveSessionMemoryNow(
       sessionId: currentSessionId,
       sessionKey: event.sessionKey,
       now: () => now.getTime(),
+      writeGate: {
+        requireRefKind: "session-transcript",
+        resolveSources: () => sessionMemorySources,
+      },
     });
     const commit = () => memoryRoot.write(filename, entry, { encoding: "utf-8" });
     await provenanceObserver.write({
@@ -275,6 +313,14 @@ async function saveSessionMemoryNow(
     const relPath = shortenHomePath(memoryFilePath);
     log.info(`Session context saved to ${relPath}`);
   } catch (err) {
+    if (err instanceof MemoryWriteGateError) {
+      log.warn("Session memory write skipped by the memory write gate", {
+        sessionKey: event.sessionKey,
+        code: err.result.code,
+        detail: err.result.message,
+      });
+      return;
+    }
     if (err instanceof Error) {
       log.error("Failed to save session memory", {
         errorName: err.name,

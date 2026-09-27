@@ -74,6 +74,7 @@ export async function prepareEmbeddedAttemptToolBase(params: {
   skillsSnapshot: EmbeddedRunAttemptParams["skillsSnapshot"];
   codeModeSkills: readonly CodeModeSkill[];
   reviewTranscript?: NonNullable<OpenClawCodingToolsOptions["exec"]>["reviewTranscript"];
+  resolveMemoryWriteSourceMessages?: OpenClawCodingToolsOptions["resolveMemoryWriteSourceMessages"];
   toolSearchCatalogExecutor: ToolSearchCatalogToolExecutor;
 }) {
   const { attempt } = params;
@@ -338,6 +339,7 @@ export async function prepareEmbeddedAttemptToolBase(params: {
             recordToolPrepStage: params.markCoreToolStage,
             onToolOutcome: attempt.onToolOutcome,
             isTurnTainted: attempt.isTurnTainted,
+            resolveMemoryWriteSourceMessages: params.resolveMemoryWriteSourceMessages,
             allocateToolOutcomeOrdinal: attempt.allocateToolOutcomeOrdinal,
             skillUsagePaths: params.skillUsagePaths,
             conversationCapabilityProfile: runtimeCapabilityProfile,

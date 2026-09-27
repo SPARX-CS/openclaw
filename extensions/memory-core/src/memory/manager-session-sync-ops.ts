@@ -58,8 +58,15 @@ export abstract class MemoryManagerSessionSyncOps extends MemoryManagerWatchOps 
           settings: this.settings,
           concurrency: this.getIndexConcurrency(),
         });
-        this.sourceInspections.set("memory", inspection);
+        const { freshness, ...sourceInspection } = inspection;
+        this.sourceInspections.set("memory", sourceInspection);
         this.dirty ||= inspection.dirty;
+        if (freshness.stale) {
+          log.warn(
+            `memory index stale for agent ${this.agentId}: ${freshness.stalePaths.length} memory file(s) ` +
+              `changed more than ${Math.floor(freshness.thresholdMs / 60_000)} min ago are not indexed`,
+          );
+        }
       } catch (error) {
         this.sourceInspections.set("memory", { eligible: null, issues: [String(error)] });
         this.dirty = true;

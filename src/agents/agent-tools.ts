@@ -9,6 +9,7 @@ import { messageToolOwnsVisibleReply } from "../auto-reply/source-reply-delivery
 import { resolveEventSessionRoutingPolicy } from "../infra/event-session-routing.js";
 import { mergeGatewayAgentCliPath } from "../infra/openclaw-cli-shim.js";
 import { logWarn } from "../logger.js";
+import { renderMemoryWriteSourceMessages } from "../memory/memory-write-gate.js";
 import type { PluginHookToolRequesterContext } from "../plugins/hook-types.js";
 import { appendRuntimePluginToolGrant } from "../plugins/tool-grant-allowlist.js";
 import { getPluginToolMeta } from "../plugins/tool-metadata.js";
@@ -270,6 +271,24 @@ export function createOpenClawCodingToolsInternal(
         : "agent",
     sessionId: options?.sessionId,
     sessionKey: options?.runSessionKey ?? options?.sessionKey,
+    // Memory files (MEMORY.md, memory/*.md, USER.md) only accept lines the
+    // current session transcript supports; see src/memory/memory-write-gate.ts.
+    writeGate: {
+      requireRefKind: "session-transcript",
+      resolveSources: () => {
+        const sessionId = options?.sessionId;
+        const messages = options?.resolveMemoryWriteSourceMessages?.();
+        if (!sessionId || !messages) {
+          return [];
+        }
+        return [
+          {
+            ref: { kind: "session-transcript", sessionId, messageCount: messages.length },
+            text: renderMemoryWriteSourceMessages(messages),
+          },
+        ];
+      },
+    },
   });
   const includeCoreTools = options?.includeCoreTools !== false;
   const toolConstructionPlan = options?.toolConstructionPlan ?? {

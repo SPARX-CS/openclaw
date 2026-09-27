@@ -10,12 +10,27 @@ const MEMORY_ARTIFACT_PROVENANCE_MAX_ENTRIES = 50_000;
 
 export type MemoryArtifactOriginClass = "agent" | "untrusted";
 
+/** What a gated write was checked against (see memory-write-gate.ts). */
+export type MemoryArtifactSourceRef =
+  | { kind: "session-transcript"; sessionId: string; messageCount?: number }
+  | { kind: "file"; path: string }
+  | { kind: "tool-result"; toolCallId: string; toolName?: string }
+  | { kind: "hook-metadata"; label: string };
+
+export type MemoryArtifactWriteVerification = {
+  gate: string;
+  checkedLines: number;
+  sourceRefs: MemoryArtifactSourceRef[];
+};
+
 export type MemoryArtifactProvenance = {
   fileHash: string;
   originClass: MemoryArtifactOriginClass;
   observedAt: number;
   sessionId?: string;
   sessionKey?: string;
+  /** Present when the latest write passed the memory write gate. */
+  verification?: MemoryArtifactWriteVerification;
 };
 
 type StoredMemoryArtifactProvenance = MemoryArtifactProvenance & {
@@ -126,7 +141,20 @@ function toPublicProvenance(stored: StoredMemoryArtifactProvenance): MemoryArtif
     observedAt: stored.observedAt,
     ...(stored.sessionId ? { sessionId: stored.sessionId } : {}),
     ...(stored.sessionKey ? { sessionKey: stored.sessionKey } : {}),
+    ...(isWriteVerification(stored.verification) ? { verification: stored.verification } : {}),
   };
+}
+
+function isWriteVerification(value: unknown): value is MemoryArtifactWriteVerification {
+  if (!value || typeof value !== "object") {
+    return false;
+  }
+  const candidate = value as Partial<MemoryArtifactWriteVerification>;
+  return (
+    typeof candidate.gate === "string" &&
+    Number.isSafeInteger(candidate.checkedLines) &&
+    Array.isArray(candidate.sourceRefs)
+  );
 }
 
 export async function recordMemoryArtifactWriteProvenance(params: {
@@ -138,6 +166,7 @@ export async function recordMemoryArtifactWriteProvenance(params: {
   observedAt: number;
   sessionId?: string;
   sessionKey?: string;
+  verification?: MemoryArtifactWriteVerification;
 }): Promise<(() => Promise<void>) | undefined> {
   const address = resolveAddress(params);
   if (!address) {
@@ -163,6 +192,7 @@ export async function recordMemoryArtifactWriteProvenance(params: {
       observedAt: params.observedAt,
       ...(params.sessionId ? { sessionId: params.sessionId } : {}),
       ...(params.sessionKey ? { sessionKey: params.sessionKey } : {}),
+      ...(params.verification ? { verification: params.verification } : {}),
       reservationId,
     };
   });

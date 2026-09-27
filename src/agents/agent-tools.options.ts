@@ -132,6 +132,11 @@ export type OpenClawCodingToolsOptions = {
   onToolOutcome?: ToolOutcomeObserver;
   /** Reads the sticky untrusted-content flag for the current user turn. */
   isTurnTainted?: () => boolean;
+  /**
+   * Live transcript messages of this run. Memory-file writes are verified
+   * against them by the memory write gate; without them such writes are refused.
+   */
+  resolveMemoryWriteSourceMessages?: () => readonly unknown[] | undefined;
   /** Supplies run-global model-call ordering for parallel tool outcomes. */
   allocateToolOutcomeOrdinal?: (toolCallId?: string) => number;
   /** Runtime-only resolved skill paths that the read tool may load under workspaceOnly. */

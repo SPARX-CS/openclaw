@@ -365,6 +365,48 @@ describe("session-memory hook", () => {
     });
   });
 
+  it("records the memory write gate verification against the ended session", async () => {
+    memoryProvenanceMocks.recordMemoryArtifactWriteProvenance.mockClear();
+    const sessionContent = createMockSessionContent([
+      { role: "user", content: "Move the Q3 review with Alvarez to 2026-10-02" },
+      { role: "assistant", content: "Noted: moved to 2026-10-02." },
+    ]);
+
+    const { files } = await runNewWithPreviousSession({ sessionContent });
+
+    expect(files).toHaveLength(1);
+    expect(memoryProvenanceMocks.recordMemoryArtifactWriteProvenance).toHaveBeenCalledWith(
+      expect.objectContaining({
+        sessionId: "test-123",
+        verification: expect.objectContaining({
+          gate: "lexical-v1",
+          sourceRefs: [
+            { kind: "session-transcript", sessionId: "test-123" },
+            { kind: "hook-metadata", label: "session-memory" },
+          ],
+        }),
+      }),
+    );
+  });
+
+  it("skips the write with a diagnostic when no session id can be referenced", async () => {
+    memoryProvenanceMocks.recordMemoryArtifactWriteProvenance.mockClear();
+    loggerMocks.warn.mockClear();
+    const tempDir = await createCaseWorkspace("workspace-unreferenced");
+
+    const { files } = await runNewWithPreviousSessionEntry({
+      tempDir,
+      previousSessionEntry: { sessionId: "" },
+    });
+
+    expect(files).toEqual([]);
+    expect(memoryProvenanceMocks.recordMemoryArtifactWriteProvenance).not.toHaveBeenCalled();
+    expect(loggerMocks.warn).toHaveBeenCalledWith(
+      "Session memory write skipped: no session id to reference as the memory source",
+      { sessionKey: "agent:main:main" },
+    );
+  });
+
   it("does not commit session memory when provenance recording fails", async () => {
     memoryProvenanceMocks.recordMemoryArtifactWriteProvenance.mockRejectedValueOnce(
       new Error("provenance unavailable"),

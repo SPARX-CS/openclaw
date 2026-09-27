@@ -7,6 +7,13 @@ import {
   normalizeMemoryArtifactRelativePath,
   recordMemoryArtifactWriteProvenance,
 } from "../memory/memory-artifact-provenance.js";
+import {
+  evaluateMemoryWrite,
+  MEMORY_WRITE_GATE_VERSION,
+  MemoryWriteGateError,
+  type MemoryWriteSource,
+  type MemoryWriteSourceRef,
+} from "../memory/memory-write-gate.js";
 import { captureAgentToolSourceExecutionGuard } from "./agent-tool-source-execution-guard.js";
 
 export type MemoryWriteProvenanceObserver = {
@@ -100,6 +107,13 @@ function resolveMemoryRelativePath(root: string, absolutePath: string): string |
   return normalizeMemoryArtifactRelativePath(relativePath.replaceAll(path.sep, "/"));
 }
 
+export type MemoryWriteGateOptions = {
+  /** Source text the written lines must be supported by; resolved per write. */
+  resolveSources: () => readonly MemoryWriteSource[] | Promise<readonly MemoryWriteSource[]>;
+  /** Reject unless at least one resolvable source of this kind is present. */
+  requireRefKind?: MemoryWriteSourceRef["kind"];
+};
+
 export function createMemoryWriteProvenanceObserver(params: {
   mutationRoot: string;
   workspaceDir: string;
@@ -108,6 +122,8 @@ export function createMemoryWriteProvenanceObserver(params: {
   sessionId?: string;
   sessionKey?: string;
   now?: () => number;
+  /** When set, writes that fail the memory write gate throw before anything lands. */
+  writeGate?: MemoryWriteGateOptions;
 }): MemoryWriteProvenanceObserver {
   const now = params.now ?? Date.now;
   const resolvePath = params.resolvePath ?? canonicalPathFromExistingAncestor;
@@ -128,6 +144,28 @@ export function createMemoryWriteProvenanceObserver(params: {
         await commit();
         return;
       }
+      let verification: Parameters<typeof recordMemoryArtifactWriteProvenance>[0]["verification"];
+      if (params.writeGate) {
+        const result = evaluateMemoryWrite({
+          contentBefore,
+          contentAfter,
+          sources: await params.writeGate.resolveSources(),
+          requireRefKind: params.writeGate.requireRefKind,
+        });
+        if (!result.ok) {
+          logWarn(
+            `memory write gate rejected ${relativePath} (${result.code}` +
+              `${result.code === "unsupported-lines" ? `, ${result.rejections.length} line(s)` : ""}` +
+              `${params.sessionId ? `, session ${params.sessionId}` : ""})`,
+          );
+          throw new MemoryWriteGateError(relativePath, result);
+        }
+        verification = {
+          gate: MEMORY_WRITE_GATE_VERSION,
+          checkedLines: result.checkedLines,
+          sourceRefs: result.sourceRefs,
+        };
+      }
       const rollback = await recordMemoryArtifactWriteProvenance({
         workspaceDir: params.workspaceDir,
         relativePath,
@@ -137,6 +175,7 @@ export function createMemoryWriteProvenanceObserver(params: {
         observedAt: now(),
         sessionId: params.sessionId,
         sessionKey: params.sessionKey,
+        ...(verification ? { verification } : {}),
       });
       try {
         await commit();

@@ -185,6 +185,14 @@ function cronCreatorToolNames(
   return list?.map((entry) => (typeof entry === "string" ? entry : entry.name));
 }
 
+// Memory-file writes must be supported by the run transcript (memory write gate).
+function memoryWriteTranscript(sessionId: string, ...userTexts: string[]) {
+  return {
+    sessionId,
+    resolveMemoryWriteSourceMessages: () => userTexts.map((content) => ({ role: "user", content })),
+  };
+}
+
 describe("createOpenClawCodingTools", () => {
   it("forwards the session web-search gate to core tool materialization", () => {
     vi.mocked(createOpenClawTools).mockClear();
@@ -2581,6 +2589,7 @@ describe("createOpenClawCodingTools", () => {
         trigger: "memory",
         memoryFlushWritePath: memoryRelativePath,
         senderIsOwner: false,
+        ...memoryWriteTranscript("flush-session", "Store durable notes now."),
       });
       const writeExecute = requireToolExecute(requireTool(tools, "write"));
 
@@ -2609,7 +2618,7 @@ describe("createOpenClawCodingTools", () => {
       const tools = createOpenClawCodingTools({
         workspaceDir,
         config: { tools: { fs: { workspaceOnly: true } } },
-        sessionId: "source-session",
+        ...memoryWriteTranscript("source-session", "Please keep a note."),
         sessionKey: "agent:main:policy-session",
         runSessionKey: "agent:main:durable-session",
         senderIsOwner: true,
@@ -2687,6 +2696,7 @@ describe("createOpenClawCodingTools", () => {
             workspaceDir,
             senderIsOwner: true,
             isTurnTainted: () => false,
+            ...memoryWriteTranscript("recreate-session", "Recreate the note."),
           }),
           "apply_patch",
         ),
@@ -2703,6 +2713,116 @@ describe("createOpenClawCodingTools", () => {
           relativePath: "memory/recreated.md",
         }),
       ).resolves.toMatchObject({ originClass: "agent" });
+    } finally {
+      await fs.rm(workspaceDir, { recursive: true, force: true });
+    }
+  });
+
+  it("gates agent memory writes against the run transcript before anything lands", async () => {
+    const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-memory-gate-"));
+    const memoryFile = path.join(workspaceDir, "MEMORY.md");
+    try {
+      await fs.writeFile(memoryFile, "# Memory\n", "utf8");
+      const tools = createOpenClawCodingTools({
+        workspaceDir,
+        senderIsOwner: true,
+        ...memoryWriteTranscript(
+          "gate-session",
+          "The renewal quote for Northwind is $1,200 and is due 2026-10-01.",
+        ),
+      });
+      const write = requireToolExecute(requireTool(tools, "write"));
+      const edit = requireToolExecute(requireTool(tools, "edit"));
+
+      await expect(
+        write("gate-changed-number", {
+          path: "MEMORY.md",
+          content: "# Memory\n- Northwind renewal quote: $1,500, due 2026-10-01\n",
+        }),
+      ).rejects.toThrow(/line 2: contains values not present in the source \(amount "USD 1500"\)/);
+      await expect(
+        edit("gate-invented-name", {
+          path: "MEMORY.md",
+          edits: [
+            { oldText: "# Memory\n", newText: "# Memory\n- Contact at Northwind is Alvarez\n" },
+          ],
+        }),
+      ).rejects.toThrow(
+        /names a person\/entity not present in the source \(proper-noun "Alvarez"\)/,
+      );
+      await expect(fs.readFile(memoryFile, "utf8")).resolves.toBe("# Memory\n");
+      await expect(
+        readMemoryArtifactProvenance({ workspaceDir, relativePath: "MEMORY.md" }),
+      ).resolves.toBeUndefined();
+
+      await write("gate-supported", {
+        path: "MEMORY.md",
+        content: "# Memory\n- Northwind renewal quote: $1,200, due 2026-10-01\n",
+      });
+      await expect(fs.readFile(memoryFile, "utf8")).resolves.toContain("$1,200");
+      await expect(
+        readMemoryArtifactProvenance({ workspaceDir, relativePath: "MEMORY.md" }),
+      ).resolves.toMatchObject({
+        sessionId: "gate-session",
+        verification: {
+          gate: "lexical-v1",
+          checkedLines: 1,
+          sourceRefs: [{ kind: "session-transcript", sessionId: "gate-session", messageCount: 1 }],
+        },
+      });
+
+      const unsourced = createOpenClawCodingTools({ workspaceDir, senderIsOwner: true });
+      await expect(
+        requireToolExecute(requireTool(unsourced, "write"))("gate-no-source", {
+          path: "memory/notes.md",
+          content: "- plain note\n",
+        }),
+      ).rejects.toThrow(/no resolvable source reference/);
+      await expect(fs.stat(path.join(workspaceDir, "memory/notes.md"))).rejects.toThrow();
+    } finally {
+      await fs.rm(workspaceDir, { recursive: true, force: true });
+    }
+  });
+
+  it("gates memory flush appends and leaves the daily file untouched on rejection", async () => {
+    const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-memory-flush-gate-"));
+    const memoryRelativePath = "memory/2026-09-26.md";
+    const memoryFile = path.join(workspaceDir, memoryRelativePath);
+    try {
+      await fs.mkdir(path.dirname(memoryFile), { recursive: true });
+      await fs.writeFile(memoryFile, "seed\n", "utf8");
+      const write = requireToolExecute(
+        requireTool(
+          createOpenClawCodingTools({
+            workspaceDir,
+            trigger: "memory",
+            memoryFlushWritePath: memoryRelativePath,
+            senderIsOwner: true,
+            ...memoryWriteTranscript(
+              "flush-gate-session",
+              "田中さんとの打ち合わせは3月5日に決まりました。",
+              "Store durable memories now.",
+            ),
+          }),
+          "write",
+        ),
+      );
+
+      await expect(
+        write("flush-invented-name", {
+          path: memoryRelativePath,
+          content: "- 佐藤様との打ち合わせは3月5日",
+        }),
+      ).rejects.toThrow(/cjk-name "佐藤"/);
+      await expect(fs.readFile(memoryFile, "utf8")).resolves.toBe("seed\n");
+
+      await write("flush-supported", {
+        path: memoryRelativePath,
+        content: "- 田中さんとの打ち合わせは3月5日",
+      });
+      await expect(fs.readFile(memoryFile, "utf8")).resolves.toBe(
+        "seed\n- 田中さんとの打ち合わせは3月5日",
+      );
     } finally {
       await fs.rm(workspaceDir, { recursive: true, force: true });
     }
@@ -2728,6 +2848,7 @@ describe("createOpenClawCodingTools", () => {
           sandbox,
           senderIsOwner: true,
           isTurnTainted: () => true,
+          ...memoryWriteTranscript("sandbox-session", "Save a project note."),
         });
         const filePath = (relative: string) =>
           pathKind === "container" ? `/workspace/${relative}` : relative;
