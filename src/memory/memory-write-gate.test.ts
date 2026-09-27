@@ -160,7 +160,7 @@ describe("memory write gate", () => {
     const result = evaluate("a\nb 41\nb 42\n\n---\nc 43", "a b 41", "a\nb 41\n");
     expect(result.ok).toBe(false);
     expect(
-      result.ok === false && result.code === "unsupported-lines"
+      !result.ok && result.code === "unsupported-lines"
         ? result.rejections.map((rejection) => [rejection.lineNumber, rejection.line])
         : [],
     ).toEqual([

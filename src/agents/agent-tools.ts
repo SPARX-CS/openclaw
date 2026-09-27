@@ -24,12 +24,12 @@ import {
 } from "./agent-tool-metadata.js";
 import { createCodingToolsGatewayCaller } from "./agent-tools.caller.js";
 import { finalizeAgentTools } from "./agent-tools.finalize.js";
+import { createAgentMemoryWriteObserver } from "./agent-tools.memory-write.js";
 import {
   filterToolsByMessageProvider,
   messageProviderExcludesTool,
 } from "./agent-tools.message-provider-policy.js";
 import { applyModelProviderToolPolicy } from "./agent-tools.model-provider-policy.js";
-import { createAgentMemoryWriteObserver } from "./agent-tools.memory-write.js";
 import type { OpenClawCodingToolsOptions } from "./agent-tools.options.js";
 import { wrapToolMemoryFlushAppendOnlyWrite } from "./agent-tools.read.js";
 import {

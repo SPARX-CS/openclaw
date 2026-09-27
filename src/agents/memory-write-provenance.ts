@@ -155,8 +155,9 @@ export function createMemoryWriteProvenanceObserver(params: {
         if (!result.ok) {
           logWarn(
             `memory write gate rejected ${relativePath} (${result.code}` +
-              `${result.code === "unsupported-lines" ? `, ${result.rejections.length} line(s)` : ""}` +
-              `${params.sessionId ? `, session ${params.sessionId}` : ""})`,
+              (result.code === "unsupported-lines" ? `, ${result.rejections.length} line(s)` : "") +
+              (params.sessionId ? `, session ${params.sessionId}` : "") +
+              ")",
           );
           throw new MemoryWriteGateError(relativePath, result);
         }

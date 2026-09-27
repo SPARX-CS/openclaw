@@ -391,7 +391,7 @@ function contentText(content: unknown): string[] {
     return [];
   }
   return content.flatMap((part) =>
-    isRecord(part) && part.type === "text" ? [String(part.text ?? "")] : [],
+    isRecord(part) && part.type === "text" && typeof part.text === "string" ? [part.text] : [],
   );
 }
 
@@ -416,7 +416,11 @@ export function renderMemoryWriteSourceMessages(messages: readonly unknown[]): s
         ...contentText(message.content).filter((text) => !text.startsWith(REJECTION_PREFIX)),
       );
     } else if (message.role === "bashExecution") {
-      parts.push(String(message.command ?? ""), String(message.output ?? ""));
+      for (const value of [message.command, message.output]) {
+        if (typeof value === "string") {
+          parts.push(value);
+        }
+      }
     }
   }
   return parts.filter(Boolean).join("\n");

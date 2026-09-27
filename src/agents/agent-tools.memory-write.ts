@@ -2,8 +2,8 @@
 import { renderMemoryWriteSourceMessages } from "../memory/memory-write-gate.js";
 import type { OpenClawCodingToolsOptions } from "./agent-tools.options.js";
 import { createMemoryWriteProvenanceObserver } from "./memory-write-provenance.js";
-import type { SandboxFsBridge } from "./sandbox/fs-bridge.types.js";
 import { resolveSandboxFileIdentity } from "./sandbox/file-mutation-identity.js";
+import type { SandboxFsBridge } from "./sandbox/fs-bridge.types.js";
 
 export function createAgentMemoryWriteObserver(params: {
   options?: OpenClawCodingToolsOptions;
