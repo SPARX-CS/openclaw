@@ -6,7 +6,7 @@ Branch line (everything stacks on one 9.6 line):
 v2026.9.6 ── sparx/carry-2026.9.6 (#10: 5 carry commits + d22ceb6a4 quota classifier)
                  └─ Part A cherry-picks (36418cb43, 0520a6589, 100564050  = b7babf556, e9c026191, 10bf94470)
                       ├─ sparx/continuity-9.6       (#11, Part B)
-                      └─ sparx/memory-write-gate-9.6 (Part C)
+                      └─ sparx/memory-write-gate-9.6 (#13, Part C)
                  └─ sparx/cron-description-9.6     (#12, Part E; based on the carry head before d22ceb6a4)
 ```
 
@@ -130,9 +130,46 @@ The R1 contract ideas that carry over are rewritten for 9.6, not ported:
 - Now: `src/agents/failover/message-patterns.ts:48,129` classifies them as `rate_limit`, and `src/agents/failover/retry-evidence.ts:133` gives them a long window, so the 43e6f7692 guard stops the replay (1 run).
 - Negative cases stay unclassified. 1,664 failover/announce tests pass.
 
-## 5. Part C: memory write gate
+## 5. Part C: memory write gate (#13, `sparx/memory-write-gate-9.6`)
 
-See the Part C section appended below.
+**What 9.6 already had.** `src/agents/memory-write-provenance.ts` is the single choke point for tracked memory writes: write/edit/apply_patch, the memory flush append wrapper, and the session-memory hook. `src/memory/memory-artifact-provenance.ts` records each file's hash, origin class (`agent` or `untrusted`), session id and session key. It records **who** wrote, never **what** was written.
+
+**Added:**
+
+- `src/memory/memory-write-gate.ts` (`evaluateMemoryWrite`). A deterministic lexical support check on added lines, run before provenance is reserved and before the write:
+  - Source reference required. Missing → reject, or skip with a warning on automatic paths.
+  - The key tokens of each line must appear in the source: numbers and dates (full-width digits normalised, digit boundaries respected), amounts with matching currency, URLs, paths, quoted strings, and capitalized proper nouns that are not at sentence start.
+  - Person names are rejected unless present in the source: Mr./Ms./Dr., -san/-sama, CJK さん/様/氏/先生, and katakana runs.
+  - Only user turns, successful tool results and user shell output count as source. Assistant text and tool-call arguments do not.
+  - On rejection, the model is told which line failed and why, and nothing is written.
+  - This is not a semantic truth check.
+- Verification record `{gate: "lexical-v1", checkedLines, sourceRefs}` stored on the provenance record.
+- Gated paths:
+  - agent write/edit/apply_patch, via `agent-tools.memory-write.ts`
+  - memory flush (which does not run on CLI turns: `agent-runner-memory.ts:1226`)
+  - the session-memory hook
+- Not gated: shell writes, memory-core dreaming/forget rewrites, plugin harness file tools.
+- Watchdog `src/memory/memory-index-freshness.ts`. A file is stale when its current hash differs from `memory_index_sources` (or it is not indexed) and it changed more than 30 minutes ago. Wired into memory-core `inspectMemorySourceState`; shows in `openclaw memory status` and a log warning. There is no background timer and no doctor check.
+- Behavior change: memory-file writes without a transcript (gateway tool API, cron trigger scripts) are refused as missing-source.
+- Tests: 25 targeted files (712 tests) plus the split coding-tools tests (141).
+- Unverified:
+  - live model error delivery
+  - parallel sibling tool results
+  - false-rejection rate on real traffic
+  - names at the start of a sentence are not checked
+  - multi-file apply_patch is non-transactional in 9.6
+
+**What the private tools would need** (not implemented):
+
+| Need                                                                                                                                  | notion-memory-bridge                      | memory-graph                                                                                  |
+| ------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------- | --------------------------------------------------------------------------------------------- |
+| carry `MemoryWriteSourceRef[]` + source text (never assistant text)                                                                   | per page/block write                      | per node/edge write                                                                           |
+| call `evaluateMemoryWrite` from `openclaw/plugin-sdk/memory-core-host-runtime-core` before writing                                    | before = page text, after = proposed text | render `Entity: <name> (<type>)` / `<A> <relation> <B>` lines so names and values are checked |
+| on `ok:false` abort the whole batch (no API calls / no transaction), return `result.message`; automatic sync → skip + log             | yes                                       | yes                                                                                           |
+| store `{gate, checkedLines, sourceRefs}` next to the object                                                                           | page property                             | node/edge metadata                                                                            |
+| mirror only verified files: check `readMemoryArtifactProvenance(...).verification` + hash; refuse or flag `untrusted`/unverified      | yes                                       | n/a                                                                                           |
+| freshness: track `{id, hash, mtime}` vs last sync, call `evaluateMemoryIndexFreshness` (30 min), report `formatMemoryIndexStaleIssue` | yes                                       | yes, plus graph not older than the memory-core index                                          |
+| deletions: no gate; clear stored verification                                                                                         | yes                                       | yes                                                                                           |
 
 ## 6. Part D (design only): measuring "the same correction is never needed twice"
 
@@ -158,6 +195,16 @@ See the Part C section appended below.
 
 4. **Metric.** repeats / corrections per 100 conversations, split by attribution. Plus zero-repeat coverage: the share of correction keys never repeated within 30 days.
 5. **Evaluation.** Build isolated replay fixtures from real correction pairs, with customer data replaced. Re-run them after each change and compare repeat rate before and after with the same inputs. Natural-traffic observation does not replace this.
+
+## CI notes (fork)
+
+- `label` always fails on the fork: the GitHub App private-key secret is missing. It is infra, not code, and was commented on #11/#12.
+- Fixes made for fork CI:
+  - line-cap ratchet: Part A's `attempt-execution` growth was offset by extracting harness auth-profile selection and moving the harness-pinning tests; Part B/C growth was moved into sibling modules
+  - coercion-helper guard (shared `isRecord`)
+  - knip dead exports
+  - format of the sparx notes, including the base branch's carry-set note (fixed on the base too)
+- Local regression: `session-accessor.sqlite-cold-read.test.ts` timed out under machine contention in the broad run and passes 28/28 when run alone.
 
 ## Upstream vs carry
 
