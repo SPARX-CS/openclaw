@@ -253,6 +253,7 @@ async function runEmbeddedAttemptOwned(
             ),
           });
         },
+        resolveMemoryWriteSourceMessages: () => resources.session?.messages,
         toolSearchCatalogExecutor: (toolParams) => {
           if (!toolSearchCatalogExecutor) {
             throw new Error("Tool Search catalog executor is unavailable for this run.");

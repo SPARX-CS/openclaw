@@ -9,6 +9,11 @@ import {
   type MemoryWorkspaceFiles,
 } from "openclaw/plugin-sdk/memory-core-host-engine-storage";
 import {
+  evaluateMemoryIndexFreshness,
+  formatMemoryIndexStaleIssue,
+  type MemoryIndexFreshness,
+} from "openclaw/plugin-sdk/memory-core-host-runtime-core";
+import {
   executeSqliteQuerySync,
   getNodeSqliteKysely,
   sqliteStringSet,
@@ -31,6 +36,7 @@ type MemorySourceInspection = {
   dirty: boolean;
   eligible: number | null;
   issues: string[];
+  freshness: MemoryIndexFreshness;
 };
 
 /** Resolve exactly the entries eligible for indexing, including validated multimodal files. */
@@ -80,6 +86,8 @@ export async function inspectMemorySourceState(params: {
   settings: Pick<ResolvedMemorySearchConfig, "extraPaths" | "multimodal">;
   concurrency: number;
   files?: MemoryWorkspaceFiles;
+  nowMs?: number;
+  staleThresholdMs?: number;
 }): Promise<MemorySourceInspection> {
   const skippedRoots = new Set<string>();
   const entries = await resolveMemorySourceFileEntries({
@@ -87,12 +95,22 @@ export async function inspectMemorySourceState(params: {
     onSkippedSymlinkRoot: (root) => skippedRoots.add(root),
   });
   const indexedRows = loadMemorySourceFileState({ db: params.db, source: "memory" });
+  // Watchdog: memory files changed long ago that the index never picked up.
+  const freshness = evaluateMemoryIndexFreshness({
+    files: entries,
+    indexed: indexedRows,
+    nowMs: params.nowMs ?? Date.now(),
+    thresholdMs: params.staleThresholdMs,
+  });
+  const staleIssue = formatMemoryIndexStaleIssue(freshness);
   return {
     source: "memory",
     dirty: hasMemorySourceDrift({ entries, indexedRows }),
     eligible: entries.length,
+    freshness,
     issues: [
       ...(entries.length === 0 ? ["no eligible memory files found"] : []),
+      ...(staleIssue ? [staleIssue] : []),
       ...Array.from(
         skippedRoots,
         (root) =>

@@ -44,7 +44,29 @@ export {
 export type {
   MemoryArtifactOriginClass,
   MemoryArtifactProvenance,
+  MemoryArtifactSourceRef,
+  MemoryArtifactWriteVerification,
 } from "../memory/memory-artifact-provenance.js";
+export {
+  evaluateMemoryWrite,
+  extractMemoryClaimTokens,
+  MEMORY_WRITE_GATE_VERSION,
+  MemoryWriteGateError,
+  renderMemoryWriteSourceMessages,
+} from "../memory/memory-write-gate.js";
+export type {
+  MemoryClaimToken,
+  MemoryWriteGateResult,
+  MemoryWriteLineRejection,
+  MemoryWriteSource,
+  MemoryWriteSourceRef,
+} from "../memory/memory-write-gate.js";
+export {
+  evaluateMemoryIndexFreshness,
+  formatMemoryIndexStaleIssue,
+  MEMORY_INDEX_STALE_THRESHOLD_MS,
+} from "../memory/memory-index-freshness.js";
+export type { MemoryIndexFreshness } from "../memory/memory-index-freshness.js";
 export {
   clearMemoryPluginState,
   listMemoryCorpusSupplements,

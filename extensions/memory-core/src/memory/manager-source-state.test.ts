@@ -8,6 +8,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   inspectMemorySourceState,
   loadMemorySourceFileState,
+  resolveMemorySourceFileEntries,
   resolveMemorySourceExistingHash,
 } from "./manager-source-state.js";
 
@@ -87,6 +88,61 @@ describe("memory source state", () => {
 });
 
 const tempDirs = useAutoCleanupTempDirTracker(afterEach);
+
+describe("memory source inspection index watchdog", () => {
+  let db: DatabaseSync;
+  const settings = {
+    extraPaths: [],
+    multimodal: { enabled: false, modalities: [], maxFileBytes: 0 },
+  };
+
+  beforeEach(() => {
+    db = new DatabaseSync(":memory:");
+    ensureMemoryIndexSchema({ db, cacheEnabled: false, ftsEnabled: false });
+  });
+
+  afterEach(() => db.close());
+
+  it("reports a stale index when a memory file changed long ago is still unindexed", async () => {
+    const workspaceDir = tempDirs.make("openclaw-memory-stale-");
+    await fs.mkdir(path.join(workspaceDir, "memory"));
+    const notePath = path.join(workspaceDir, "memory", "2026-09-26.md");
+    await fs.writeFile(notePath, "# Day\n- note\n");
+    const changedAt = new Date("2026-09-26T08:00:00Z");
+    await fs.utimes(notePath, changedAt, changedAt);
+    const nowMs = changedAt.getTime() + 45 * 60_000;
+
+    const stale = await inspectMemorySourceState({
+      db,
+      workspaceDir,
+      settings,
+      concurrency: 1,
+      nowMs,
+    });
+    expect(stale.freshness).toMatchObject({ stale: true, stalePaths: ["memory/2026-09-26.md"] });
+    expect(stale.issues).toEqual([
+      expect.stringMatching(/^memory index stale: 1 memory file\(s\) changed more than 30 min ago/),
+    ]);
+
+    const [entry] = await resolveMemorySourceFileEntries({
+      workspaceDir,
+      settings,
+      concurrency: 1,
+    });
+    db.prepare(
+      "INSERT INTO memory_index_sources(path, source, hash, mtime, size) VALUES (?, ?, ?, ?, ?)",
+    ).run(entry!.path, "memory", entry!.hash, entry!.mtimeMs, entry!.size);
+    const fresh = await inspectMemorySourceState({
+      db,
+      workspaceDir,
+      settings,
+      concurrency: 1,
+      nowMs,
+    });
+    expect(fresh.freshness.stale).toBe(false);
+    expect(fresh.issues).toEqual([]);
+  });
+});
 
 describe("memory source inspection extra-path diagnostics", () => {
   let db: DatabaseSync;
