@@ -569,4 +569,3 @@ describe("embedded attempt harness pinning", () => {
     expect(firstEmbeddedAgentArg()).not.toHaveProperty("agentHarnessId", "claude-cli");
   });
 });
-/* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */
