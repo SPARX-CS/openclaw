@@ -27,7 +27,7 @@ export type MemoryWriteSource = {
   text: string;
 };
 
-export type MemoryClaimTokenKind =
+type MemoryClaimTokenKind =
   | "number"
   | "amount"
   | "url"
@@ -88,7 +88,7 @@ const AMOUNT_NUMBER = String.raw`\d+(?:\.\d+)?`;
 const NUMBER_PATTERN = /\d+(?:[.:/-]\d+)*/gu;
 
 /** NFKC, thousands separators removed, whitespace collapsed; applied to claims and sources alike. */
-export function normalizeMemoryGateText(text: string): string {
+function normalizeMemoryGateText(text: string): string {
   return text
     .normalize("NFKC")
     .replace(/(\d),(?=\d{3}(?!\d))/gu, "$1")
@@ -247,7 +247,7 @@ function isTokenSupported(token: MemoryClaimToken, source: PreparedSource): bool
 }
 
 /** Lines of `after` that are not carried over from `before` (multiset diff). */
-export function listAddedMemoryLines(
+function listAddedMemoryLines(
   before: string,
   after: string,
 ): Array<{ lineNumber: number; text: string }> {

@@ -2,7 +2,6 @@ import { describe, expect, it } from "vitest";
 import {
   evaluateMemoryWrite,
   extractMemoryClaimTokens,
-  listAddedMemoryLines,
   renderMemoryWriteSourceMessages,
   type MemoryWriteSource,
 } from "./memory-write-gate.js";
@@ -158,9 +157,15 @@ describe("memory write gate", () => {
   });
 
   it("diffs lines as a multiset", () => {
-    expect(listAddedMemoryLines("a\nb\n", "a\nb\nb\n\n---\nc")).toEqual([
-      { lineNumber: 3, text: "b" },
-      { lineNumber: 6, text: "c" },
+    const result = evaluate("a\nb 41\nb 42\n\n---\nc 43", "a b 41", "a\nb 41\n");
+    expect(result.ok).toBe(false);
+    expect(
+      result.ok === false && result.code === "unsupported-lines"
+        ? result.rejections.map((rejection) => [rejection.lineNumber, rejection.line])
+        : [],
+    ).toEqual([
+      [3, "b 42"],
+      [6, "c 43"],
     ]);
   });
 
