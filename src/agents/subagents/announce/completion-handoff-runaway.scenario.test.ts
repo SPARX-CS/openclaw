@@ -168,8 +168,8 @@ gatewayTurn.startTurn.mockImplementation(
     };
   }) => {
     const request = preflight.request;
-    const runId = String(request.idempotencyKey);
-    const settled = createDeferredCore<void>();
+    const runId = request.idempotencyKey;
+    const settled = createDeferredCore();
     gatewayTurnsSettled.set(runId, settled.promise);
     try {
       // A held key models a busy requester lane: acceptance waits for admission.
@@ -599,8 +599,8 @@ describe("completion hand-off runaway on a finished 1:1 DM requester", () => {
 
   it("4. a worker hand-off held past announceTimeoutMs before admission is cancelled, never run", async () => {
     const key = workerIdempotencyKey("worker-1");
-    const reached = createDeferredCore<void>();
-    const admission = createDeferredCore<void>();
+    const reached = createDeferredCore();
+    const admission = createDeferredCore();
     admissionHolds.set(key, { reached: reached.resolve, admitted: admission.promise });
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
     let delivery: Awaited<ReturnType<typeof deliverWorkerCompletion>>;
