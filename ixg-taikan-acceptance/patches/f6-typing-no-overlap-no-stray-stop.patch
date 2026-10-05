@@ -1,0 +1,102 @@
+--- a/src/auto-reply/dispatch.ts
++++ b/src/auto-reply/dispatch.ts
+@@ -396,8 +396,15 @@
+       await settledDeliveries;
+     } finally {
+       foregroundReplyLease?.release();
+-      markRunComplete();
+-      markDispatchIdle();
++      // A message queued behind an active turn keeps its typing controller for the queued run
++      // (followup-runner.ts completes it); sealing it here would silence that run.
++      const queuedForLater =
++        replyOperationRunState.admission?.status === "accepted" &&
++        replyOperationRunState.admission.mode === "followup";
++      if (!queuedForLater) {
++        markRunComplete();
++        markDispatchIdle();
++      }
+     }
+   }
+ }
+--- a/src/auto-reply/reply/agent-runner-run.ts
++++ b/src/auto-reply/reply/agent-runner-run.ts
+@@ -60,7 +60,7 @@
+ import { createReplyMediaContext } from "./reply-media-paths.js";
+ import * as replyRunState from "./reply-operation-run-state.js";
+ import { type ReplyOperation, replyRunRegistry } from "./reply-run-registry.js";
+-import { bindReplyOperationTyping } from "./reply-run-typing.js";
++import { bindReplyOperationTyping, refreshReplyOperationTyping } from "./reply-run-typing.js";
+ import { createReplyToModeFilterForChannel, resolveReplyToMode } from "./reply-threading.js";
+ import { prepareReplyToolAuthority } from "./reply-tool-authority.js";
+ import { admitReplyTurn, resolveReplyTurnKind } from "./reply-turn-admission.js";
+@@ -419,7 +419,13 @@
+     const queuedBehindActiveRun = isRunActive?.() === true;
+     await touchActiveSessionEntry();
+     if (queuedBehindActiveRun) {
+-      await typingSignals.signalToolStart();
++      // Keep the owner's indicator alive (as a steer does) instead of pulsing this message's own
++      // controller; this controller stays dormant for the queued run (dispatch.ts keeps it open).
++      if (queuedOperationOwner) {
++        await refreshReplyOperationTyping(queuedOperationOwner, {
++          startIfIdle: typingSignals.shouldStartImmediately,
++        });
++      }
+     } else {
+       typing.cleanup();
+     }
+--- a/src/auto-reply/reply/reply-dispatcher.ts
++++ b/src/auto-reply/reply/reply-dispatcher.ts
+@@ -740,11 +740,14 @@
+   const resolvedOnIdle = onIdle ?? typingCallbacks?.onIdle;
+   const resolvedOnCleanup = onCleanup ?? typingCallbacks?.onCleanup;
+   let typingController: TypingController | undefined;
++  // A dispatch whose message was steered into / queued behind another turn never showed typing itself;
++  // its idle stop() must not clear the live indicator of the turn that owns the chat.
++  const shouldSkipTypingStop = () => typingController?.hasStarted?.() === false;
+   const dispatcher = createReplyDispatcher({
+     ...dispatcherOptions,
+     onIdle: async () => {
+       typingController?.markDispatchIdle();
+-      const idle = resolvedOnIdle?.();
++      const idle = shouldSkipTypingStop() ? undefined : resolvedOnIdle?.();
+       if (idle) {
+         await Promise.resolve(idle);
+       }
+@@ -763,7 +766,9 @@
+     },
+     markDispatchIdle: () => {
+       typingController?.markDispatchIdle();
+-      resolvedOnIdle?.();
++      if (!shouldSkipTypingStop()) {
++        resolvedOnIdle?.();
++      }
+     },
+     markRunComplete: () => {
+       typingController?.markRunComplete();
+--- a/src/auto-reply/reply/typing.ts
++++ b/src/auto-reply/reply/typing.ts
+@@ -38,6 +38,8 @@
+   startTypingOnText: (text?: string) => Promise<void>;
+   refreshTypingTtl: () => void;
+   isActive: () => boolean;
++  /** True once this controller has asked the channel to show typing at least once. */
++  hasStarted: () => boolean;
+   markRunComplete: () => void;
+   markDispatchIdle: () => void;
+   cleanup: () => void;
+@@ -67,6 +69,7 @@
+       startTypingOnText: async () => {},
+       refreshTypingTtl: () => {},
+       isActive: () => false,
++      hasStarted: () => false,
+       markRunComplete: () => {},
+       markDispatchIdle: () => {},
+       cleanup: () => {},
+@@ -261,6 +264,7 @@
+     startTypingOnText,
+     refreshTypingTtl,
+     isActive,
++    hasStarted: () => started,
+     markRunComplete,
+     markDispatchIdle,
+     cleanup,

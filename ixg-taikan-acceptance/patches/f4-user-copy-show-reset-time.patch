@@ -1,0 +1,47 @@
+diff --git a/src/agents/failover/user-copy.ts b/src/agents/failover/user-copy.ts
+index 035eb88b3..9f7590b7a 100644
+--- a/src/agents/failover/user-copy.ts
++++ b/src/agents/failover/user-copy.ts
+@@ -18,6 +18,7 @@ import type { CliTimeoutContext, FallbackAttemptRecord } from "../failover-error
+ import { ERROR_PREFIX_RE, renderFormatErrorCopy } from "./assistant-request-failure-copy.js";
+ import { classifyFailoverReasonCore } from "./classify-core.js";
+ import {
++  CLAUDE_SUBSCRIPTION_LIMIT_RE,
+   isPeriodicUsageLimitErrorMessage,
+   isProviderCompletedErrorFinishReasonMessage,
+ } from "./message-patterns.js";
+@@ -430,16 +431,28 @@ export function renderRateLimitReplyCopy(params: {
+   if (attempts.some((attempt) => attempt.reason === "billing") || params.reason === "billing") {
+     return BILLING_ERROR_USER_MESSAGE;
+   }
++  // Provider notices that carry their own reset time ("weekly limit · resets 6pm",
++  // "session limit · resets 3pm") are shown as-is; "try again in a few minutes" would be wrong.
++  const isWindowNotice = (text: string) =>
++    isPeriodicUsageLimitErrorMessage(text) || CLAUDE_SUBSCRIPTION_LIMIT_RE.test(text);
++  const renderWindowNotice = (text: string) => {
++    const providerMessage = renderSanitizedUserFacingText(params.sanitizeText?.(text) ?? text, {
++      errorContext: true,
++    });
++    return providerMessage.startsWith("⚠️") ? providerMessage : `⚠️ ${providerMessage}`;
++  };
+   if (attempts.length === 0) {
+-    if (params.reason === "rate_limit" && isPeriodicUsageLimitErrorMessage(params.message)) {
+-      const providerMessage = renderSanitizedUserFacingText(
+-        params.sanitizeText?.(params.message) ?? params.message,
+-        { errorContext: true },
+-      );
+-      return providerMessage.startsWith("⚠️") ? providerMessage : `⚠️ ${providerMessage}`;
++    if (params.reason === "rate_limit" && isWindowNotice(params.message)) {
++      return renderWindowNotice(params.message);
+     }
+     return RATE_LIMIT_RETRY_MESSAGE;
+   }
++  const windowAttempt = attempts.findLast(
++    (attempt) => attempt.reason === "rate_limit" && isWindowNotice(attempt.error),
++  );
++  if (windowAttempt && attempts.every((attempt) => attempt.reason === "rate_limit")) {
++    return renderWindowNotice(windowAttempt.error);
++  }
+   const expiry = params.cooldownExpiry;
+   const nowMs = params.nowMs ?? Date.now();
+   if (typeof expiry === "number" && expiry > nowMs) {

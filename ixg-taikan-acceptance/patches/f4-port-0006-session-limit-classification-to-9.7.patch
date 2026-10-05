@@ -1,0 +1,86 @@
+diff --git a/src/agents/failover/classify.test.ts b/src/agents/failover/classify.test.ts
+index 1e1e785e6..81be6dd2f 100644
+--- a/src/agents/failover/classify.test.ts
++++ b/src/agents/failover/classify.test.ts
+@@ -1,5 +1,6 @@
+ import { describe, expect, it } from "vitest";
+ import { classifyFailoverReason, classifyFailoverSignal } from "./classify.js";
++import { classifyRateLimitWindow } from "./retry-evidence.js";
+ 
+ describe("HTTP 402 prose classification", () => {
+   it.each([
+@@ -266,3 +267,24 @@ describe("HTTP 5xx status classification", () => {
+     ).toEqual({ kind: "reason", reason: "overloaded" });
+   });
+ });
++
++describe("Claude subscription limit notices", () => {
++  it.each([
++    "You've hit your session limit · resets 3pm (Asia/Tokyo)",
++    "You’ve hit your session limit · resets 3pm (Asia/Tokyo)",
++    "You've hit your limit · resets 5am (UTC)",
++    "You’ve hit your limit · resets 5am (UTC)",
++  ])("classifies %s as a long-window rate limit", (message) => {
++    expect(classifyFailoverReason(message, { provider: "claude-cli" })).toBe("rate_limit");
++    expect(classifyRateLimitWindow(message).kind).toBe("long");
++  });
++
++  it.each([
++    "Your session limit resets at 3pm, so plan the migration before then.",
++    "I think you've hit your limit on coffee today.",
++    "The retry limit resets after each deploy · see the runbook",
++  ])("leaves ordinary text mentioning a limit unclassified: %s", (message) => {
++    expect(classifyFailoverReason(message, { provider: "claude-cli" })).toBeNull();
++    expect(classifyRateLimitWindow(message).kind).toBe("unknown");
++  });
++});
+diff --git a/src/agents/failover/message-patterns.ts b/src/agents/failover/message-patterns.ts
+index ec2b8e1ce..145fde4cf 100644
+--- a/src/agents/failover/message-patterns.ts
++++ b/src/agents/failover/message-patterns.ts
+@@ -43,6 +43,10 @@ const PRE_DISPATCH_TOOL_CALL_REJECTION_MESSAGES = new Set([
+ export function isPreDispatchToolCallRejectionMessage(errorMessage?: string): boolean {
+   return errorMessage !== undefined && PRE_DISPATCH_TOOL_CALL_REJECTION_MESSAGES.has(errorMessage);
+ }
++// Claude subscription notices: "You've hit your [session ]limit · resets 3pm (UTC)".
++// The middle-dot reset suffix keeps ordinary prose about limits out.
++export const CLAUDE_SUBSCRIPTION_LIMIT_RE =
++  /\byou(?:'|\u2019)ve hit your (?:[a-z]+ )?limit\s*\u00b7\s*resets\b/i;
+ const PERIODIC_USAGE_LIMIT_RE =
+   /\b(?:daily|weekly|monthly)(?:\/(?:daily|weekly|monthly))* (?:usage )?limit(?:s)?(?: (?:exhausted|reached|exceeded))?\b/i;
+ 
+@@ -122,6 +126,7 @@ const ERROR_PATTERNS = {
+     /\bresource[_ -]?exhausted\b/i,
+     /\bquota[_ -]?exceeded\b/i,
+     "usage limit",
++    CLAUDE_SUBSCRIPTION_LIMIT_RE,
+     /\btpm\b/i,
+     "tokens per minute",
+     "tokens per day",
+diff --git a/src/agents/failover/retry-evidence.ts b/src/agents/failover/retry-evidence.ts
+index e30fc92d6..7651c120e 100644
+--- a/src/agents/failover/retry-evidence.ts
++++ b/src/agents/failover/retry-evidence.ts
+@@ -12,7 +12,10 @@ import {
+   parseApiErrorInfo,
+ } from "../../shared/assistant-error-format.js";
+ import { classifyFailoverReasonFromCode } from "./classification-rules.js";
+-import { INCOMPLETE_ASSISTANT_STREAM_RE } from "./message-patterns.js";
++import {
++  CLAUDE_SUBSCRIPTION_LIMIT_RE,
++  INCOMPLETE_ASSISTANT_STREAM_RE,
++} from "./message-patterns.js";
+ import type { FailoverClassification, FailoverSignal } from "./signal.js";
+ 
+ type RateLimitWindow =
+@@ -153,7 +156,9 @@ export function resolveRetryAfterMs(
+ /** Usage-window evidence is distinct from a temporary throttle's retry floor. */
+ export function hasLongWindowRateLimitEvidence(message: string | undefined): boolean {
+   return Boolean(
+-    message && LONG_WINDOW_RATE_LIMIT_RE.test(message) && !SHORT_RATE_LIMIT_UNIT_RE.test(message),
++    message &&
++    (CLAUDE_SUBSCRIPTION_LIMIT_RE.test(message) ||
++      (LONG_WINDOW_RATE_LIMIT_RE.test(message) && !SHORT_RATE_LIMIT_UNIT_RE.test(message))),
+   );
+ }
+ 
