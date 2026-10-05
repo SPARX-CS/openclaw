@@ -1,0 +1,83 @@
+# lineworks-monitor.progress-example.diff  (ixg Issue #4・F7 の例。plugin 本体は変えず、必要な編集だけを示す)
+#
+# 目的: plugin 自前の intervalAck タイマーが push する瞬間に、その会話の「いまの段階」（道具のラベル・段階の経過秒・失敗）を
+#       本体から読む。本体の変更は要らない（core.channel.inbound.dispatchReply = dispatchAssembledChannelTurn が replyOptions を受ける）。
+# 前提: reference/text-channel-progress.ts と reference/text-channel-progress-board.ts を plugin の src へそのまま置く（2 ファイル・依存は型のみ）。
+# 編集: 6 か所（+11 / -4）。
+#   1. import createProgressBoard
+#   2. monitorLineworksProvider の intervalAckStates の隣に board（intervalAckStates は関数内なので同じ寿命。timer も無く clear は不要）
+#   3. dispatch ごとに progress = board.attach(intervalAckKey)  … key は timer と同じ account + to（会話）
+#   4. dispatchReply の replyOptions: progress?.replyOptions    … suppressDefaultToolProgressMessages:true と進捗 callback 一式
+#   5. pushIntervalAck: board.render(key, Date.now()) ?? 従来の template   … null（何も分からない）なら今まで通りの固定文
+#   6. finally で progress?.detach()
+# firstDelayMs（本番 30 秒）・intervalMs（本番 60 秒）・scope（本番 direct のみ）・template・activeDispatches は一切変えない。
+# scope が group を除く時は intervalAckSpec が null なので attach も replyOptions も無く、group の core の動きは変わらない。
+#
+# 当て方: plugin の src で  patch -p1 < lineworks-monitor.progress-example.diff   （または git apply -p1）
+#
+--- a/lineworks-monitor.ts
++++ b/lineworks-monitor.ts
+@@ -25,6 +25,7 @@
+ import { resolveDefaultLineworksAccountId } from "./lineworks-accounts.js";
+ import { recordLineworksGroupIntake, isPhotoOnlyRoomMedia } from "./group-intake.js";
+ import { createLineworksBot } from "./lineworks-bot.js";
++import { createProgressBoard } from "./text-channel-progress-board.js";
+ import { pushMessageLineworks, rememberLineworksQuietConfig } from "./lineworks-send.js";
+ import { noteQuietInbound } from "./quiet-hours.js";
+ import { resolveLineworksAccessToken } from "./lineworks-channel-access-token.js";
+@@ -359,6 +360,8 @@
+   const { accountId, config, runtime, abortSignal, webhookPath } = opts;
+   const resolvedAccountId = accountId ?? resolveDefaultLineworksAccountId(config);
+   const intervalAckStates = new Map<string, LineworksIntervalAckState>();
++  // 会話ごとの「いまの段階」の掲示板。送信もタイマーも持たない（intervalAckStates と同じ寿命・同じ key で引く）。
++  const progressBoard = createProgressBoard();
+   let stopped = false;
+ 
+   const clearIntervalAckState = (state: LineworksIntervalAckState): void => {
+@@ -612,6 +615,7 @@
+       });
+       let intervalAckKey: string | null = null;
+       let intervalAckState: LineworksIntervalAckState | null = null;
++      let progress: ReturnType<typeof progressBoard.attach> | null = null;
+ 
+       try {
+         if (intervalAckSpec && !stopped) {
+@@ -619,6 +623,7 @@
+             ? `lineworks:channel:${ctx.channelId}`
+             : `lineworks:user:${ctx.userId}`;
+           intervalAckKey = `${bot.account.accountId}\u0000${intervalAckTo}`;
++          progress = progressBoard.attach(intervalAckKey); // dispatch ごとに 1 つ（timer は会話で 1 本のまま）
+           const existingState = intervalAckStates.get(intervalAckKey);
+           if (existingState) {
+             intervalAckState = existingState;
+@@ -646,10 +651,10 @@
+               state.count += 1;
+               const currentCount = state.count;
+               const startedAt = Date.now();
+-              const text = renderLineworksIntervalAckText(
+-                intervalAckSpec.template,
+-                startedAt - state.startedAt,
+-              );
++              // 本体から読めた「いまの段階」。何も分からない時は null → 従来の固定 template
++              const text =
++                progressBoard.render(intervalAckKey!, startedAt) ??
++                renderLineworksIntervalAckText(intervalAckSpec.template, startedAt - state.startedAt);
+               pushMessageLineworks(intervalAckTo, text, {
+                 cfg: config,
+                 accountId: bot.account.accountId,
+@@ -759,6 +764,7 @@
+                 },
+               },
+               replyPipeline: {},
++              replyOptions: progress?.replyOptions, // suppressDefaultToolProgressMessages:true と進捗の callback 一式
+               record: {
+                 updateLastRoute: !ctx.isGroup
+                   ? {
+@@ -806,6 +812,7 @@
+         );
+         throw err;
+       } finally {
++        progress?.detach();
+         if (intervalAckKey && intervalAckState) {
+           intervalAckState.activeDispatches -= 1;
+           if (intervalAckState.activeDispatches === 0) {

@@ -1,0 +1,203 @@
+diff --git a/src/agents/tools/pdf-tool.ts b/src/agents/tools/pdf-tool.ts
+index 35fa294a0..eba017b32 100644
+--- a/src/agents/tools/pdf-tool.ts
++++ b/src/agents/tools/pdf-tool.ts
+@@ -41,6 +41,7 @@ import { prepareSimpleCompletionModel } from "../simple-completion-runtime.js";
+ import type { ToolFsPolicy } from "../tool-fs-policy.js";
+ import { readFiniteNumberParam, ToolInputError, type AnyAgentTool } from "./common.js";
+ import { coerceImageModelConfig, type ImageModelConfig } from "./image-tool.helpers.js";
++import { buildNotPdfFailure, explainMediaToolFailure } from "./media-tool-failure.js";
+ import {
+   buildMediaReferenceDetails,
+   buildTextToolResult,
+@@ -518,25 +519,37 @@ export function createPdfTool(options?: {
+         throw new Error("PDF reference resolved without a path.");
+       }
+ 
+-      const media = sandboxConfig
+-        ? await loadWebMediaRaw(resolvedPath, {
+-            maxBytes,
+-            sandboxValidated: true,
+-            readFile: createSandboxBridgeReadFile({ sandbox: sandboxConfig }),
+-          })
+-        : await loadWebMediaRaw(resolvedPath, {
+-            maxBytes,
+-            localRoots,
+-            ...(options?.workspaceDir ? { workspaceDir: options.workspaceDir } : {}),
+-            ...(isHttpUrl ? { readIdleTimeoutMs: REMOTE_MEDIA_READ_IDLE_TIMEOUT_MS } : {}),
+-            ssrfPolicy: remoteMediaSsrfPolicy,
+-            // Forward the run abort signal into the fetch layer so an abort
+-            // mid-download disconnects the in-flight socket.
+-            ...(signal ? { requestInit: { signal } } : {}),
+-          });
++      const media = await explainMediaToolFailure(
++        {
++          toolName: "pdf",
++          noun: "PDF ファイル",
++          allowedRoots: sandboxConfig ? undefined : localRoots,
++          ...(signal ? { signal } : {}),
++        },
++        async () =>
++          sandboxConfig
++            ? await loadWebMediaRaw(resolvedPath, {
++                maxBytes,
++                sandboxValidated: true,
++                readFile: createSandboxBridgeReadFile({ sandbox: sandboxConfig }),
++              })
++            : await loadWebMediaRaw(resolvedPath, {
++                maxBytes,
++                localRoots,
++                ...(options?.workspaceDir ? { workspaceDir: options.workspaceDir } : {}),
++                ...(isHttpUrl ? { readIdleTimeoutMs: REMOTE_MEDIA_READ_IDLE_TIMEOUT_MS } : {}),
++                ssrfPolicy: remoteMediaSsrfPolicy,
++                // Forward the run abort signal into the fetch layer so an abort
++                // mid-download disconnects the in-flight socket.
++                ...(signal ? { requestInit: { signal } } : {}),
++              }),
++      );
+ 
+       if (normalizeMimeType(media.contentType) !== "application/pdf") {
+-        throw new Error(`Expected PDF but got ${media.contentType ?? media.kind}: ${pdfRaw}`);
++        throw buildNotPdfFailure(
++          { toolName: "pdf", noun: "PDF ファイル" },
++          normalizeMimeType(media.contentType) ?? media.kind,
++        );
+       }
+ 
+       const filename =
+diff --git a/src/agents/tools/media-tool-shared.ts b/src/agents/tools/media-tool-shared.ts
+index 2991a3263..42b734afe 100644
+--- a/src/agents/tools/media-tool-shared.ts
++++ b/src/agents/tools/media-tool-shared.ts
+@@ -48,6 +48,7 @@ import {
+   getCurrentCapabilityMetadataSnapshot,
+   hasSnapshotCapabilityAvailability,
+ } from "./manifest-capability-availability.js";
++import { explainMediaToolFailure } from "./media-tool-failure.js";
+ import {
+   buildToolModelConfigFromCandidates,
+   coerceToolModelConfig,
+@@ -574,21 +575,32 @@ export async function loadMediaToolReferences<T>(params: {
+             })
+           : undefined;
+       try {
+-        media = await loadWebMedia(resolvedPath ?? resolvedInput, {
+-          maxBytes: params.maxBytes,
+-          ...(params.sandbox
+-            ? {
+-                sandboxValidated: true,
+-                readFile: createSandboxBridgeReadFile({ sandbox: params.sandbox }),
+-              }
+-            : { localRoots, ssrfPolicy: params.ssrfPolicy }),
+-          ...(params.toolName === "image_generate" && reference.isHttpUrl
+-            ? { readIdleTimeoutMs: REMOTE_MEDIA_READ_IDLE_TIMEOUT_MS }
+-            : {}),
+-          ...(timeout?.signal || params.signal
+-            ? { requestInit: { signal: timeout?.signal ?? params.signal } }
+-            : {}),
+-        });
++        media = await explainMediaToolFailure(
++          {
++            toolName: params.toolName,
++            noun: { image: "画像ファイル", video: "動画ファイル", audio: "音声ファイル" }[
++              params.expectedKind
++            ],
++            allowedRoots: params.sandbox ? undefined : localRoots,
++            ...(params.signal ? { signal: params.signal } : {}),
++          },
++          () =>
++            loadWebMedia(resolvedPath ?? resolvedInput, {
++              maxBytes: params.maxBytes,
++              ...(params.sandbox
++                ? {
++                    sandboxValidated: true,
++                    readFile: createSandboxBridgeReadFile({ sandbox: params.sandbox }),
++                  }
++                : { localRoots, ssrfPolicy: params.ssrfPolicy }),
++              ...(params.toolName === "image_generate" && reference.isHttpUrl
++                ? { readIdleTimeoutMs: REMOTE_MEDIA_READ_IDLE_TIMEOUT_MS }
++                : {}),
++              ...(timeout?.signal || params.signal
++                ? { requestInit: { signal: timeout?.signal ?? params.signal } }
++                : {}),
++            }),
++        );
+       } finally {
+         timeout?.cleanup();
+       }
+diff --git a/src/agents/tools/image-tool.ts b/src/agents/tools/image-tool.ts
+index 3620a10a5..071edfb39 100644
+--- a/src/agents/tools/image-tool.ts
++++ b/src/agents/tools/image-tool.ts
+@@ -52,6 +52,7 @@ import {
+   buildNativeImageToolResult,
+   type LoadedImageForTool,
+ } from "./image-tool.result.js";
++import { explainMediaToolFailure } from "./media-tool-failure.js";
+ import {
+   buildTextToolResult,
+   normalizeMediaReferenceList,
+@@ -585,6 +586,18 @@ export function createImageTool(options?: {
+           });
+           const imageWebMedia = await imageToolProviderDeps.loadImageWebMediaRuntime();
+           signal?.throwIfAborted();
++          const explainLoadFailure = <T>(load: () => Promise<T>) =>
++            explainMediaToolFailure(
++              {
++                toolName: "view_image",
++                noun: "画像ファイル",
++                allowedRoots: sandboxConfig
++                  ? undefined
++                  : [...mediaLocalRoots, ...mediaInboundRoots],
++                ...(signal ? { signal } : {}),
++              },
++              load,
++            );
+ 
+           const media = isDataUrl
+             ? await (async () => {
+@@ -597,23 +610,27 @@ export function createImageTool(options?: {
+                 });
+               })()
+             : sandboxConfig
+-              ? await imageWebMedia.loadWebMedia(resolvedPath ?? resolvedImage, {
+-                  maxBytes,
+-                  sandboxValidated: true,
+-                  readFile: createSandboxBridgeReadFile({ sandbox: sandboxConfig }),
+-                  imageCompression,
+-                })
+-              : await imageWebMedia.loadWebMedia(resolvedPath ?? resolvedImage, {
+-                  maxBytes,
+-                  localRoots: mediaLocalRoots,
+-                  inboundRoots: mediaInboundRoots,
+-                  ssrfPolicy: remoteMediaSsrfPolicy,
+-                  ...(isHttpUrl ? { readIdleTimeoutMs: REMOTE_MEDIA_READ_IDLE_TIMEOUT_MS } : {}),
+-                  // Forward the run abort signal into the fetch layer so an abort
+-                  // mid-download disconnects the in-flight socket.
+-                  ...(signal ? { requestInit: { signal } } : {}),
+-                  imageCompression,
+-                });
++              ? await explainLoadFailure(() =>
++                  imageWebMedia.loadWebMedia(resolvedPath ?? resolvedImage, {
++                    maxBytes,
++                    sandboxValidated: true,
++                    readFile: createSandboxBridgeReadFile({ sandbox: sandboxConfig }),
++                    imageCompression,
++                  }),
++                )
++              : await explainLoadFailure(() =>
++                  imageWebMedia.loadWebMedia(resolvedPath ?? resolvedImage, {
++                    maxBytes,
++                    localRoots: mediaLocalRoots,
++                    inboundRoots: mediaInboundRoots,
++                    ssrfPolicy: remoteMediaSsrfPolicy,
++                    ...(isHttpUrl ? { readIdleTimeoutMs: REMOTE_MEDIA_READ_IDLE_TIMEOUT_MS } : {}),
++                    // Forward the run abort signal into the fetch layer so an abort
++                    // mid-download disconnects the in-flight socket.
++                    ...(signal ? { requestInit: { signal } } : {}),
++                    imageCompression,
++                  }),
++                );
+           signal?.throwIfAborted();
+           if (media.kind !== "image") {
+             throw new Error(`Unsupported media type: ${media.kind}`);

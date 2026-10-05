@@ -1,0 +1,391 @@
+diff --git a/src/agents/tools/media-tool-failure.ts b/src/agents/tools/media-tool-failure.ts
+new file mode 100644
+index 000000000..9c7498aae
+--- /dev/null
++++ b/src/agents/tools/media-tool-failure.ts
+@@ -0,0 +1,210 @@
++/**
++ * Model-facing failure texts for tools that load a media reference (pdf, view_image, the *_generate
++ * reference inputs). The media layer keeps its own messages (MediaFetchError, LocalMediaAccessError);
++ * this wraps them at the tool layer into Japanese text that says which tool and which stage failed,
++ * what the model can try next, and what to ask the customer (who cannot see internal state).
++ * URLs, local paths, credentials and the origin's response body stay out of the text; the one
++ * exception is the list of allowed roots the tool really enforces.
++ */
++import { isAbortError } from "../../infra/abort-signal.js";
++import { MediaFetchError } from "../../media/fetch.js";
++import { LocalMediaAccessError } from "../../media/local-media-access.js";
++import { withToolOperatorHint } from "../tool-operator-hint.js";
++
++type MediaToolFailureContext = {
++  /** Tool name shown to the model, e.g. "pdf" or "view_image". */
++  toolName: string;
++  /** What the tool loads, in Japanese, e.g. "PDF ファイル" or "画像ファイル". */
++  noun: string;
++  /** The roots the tool really allows for local files; omit when the tool reads through a sandbox. */
++  allowedRoots?: readonly string[];
++  signal?: AbortSignal;
++};
++
++const MAX_LISTED_ROOTS = 8;
++
++const CUSTOMER_VIEW =
++  "利用者はこちらの内部の状況を知りません。結論を先に、何が足りないか／何が問題か／利用者に何を頼みたいかを、分かる言葉で伝えてください。";
++
++function failure(
++  ctx: MediaToolFailureContext,
++  stage: string,
++  lines: string[],
++  original: unknown,
++  extra: { status?: number; tag?: string } = {},
++): Error {
++  const error = new Error(
++    [
++      `${ctx.toolName} ツールで失敗しました（段階: ${stage}）。`,
++      ...lines,
++      CUSTOMER_VIEW,
++      ...(extra.tag ? [`(技術的な理由: ${extra.tag})`] : []),
++    ].join("\n"),
++    { cause: original },
++  );
++  if (extra.status !== undefined) {
++    Object.defineProperty(error, "status", { value: extra.status, enumerable: true });
++  }
++  // Operator logs keep the original (already redacted) message; the model never sees it.
++  const originalMessage = original instanceof Error ? original.message : String(original);
++  return withToolOperatorHint(error, `original error: ${originalMessage}`);
++}
++
++function listRoots(roots: readonly string[] | undefined): string {
++  if (!roots || roots.length === 0) {
++    return "作業場（workspace）の中";
++  }
++  const shown = roots.slice(0, MAX_LISTED_ROOTS).join("、");
++  return roots.length > MAX_LISTED_ROOTS
++    ? `${shown} ほか ${roots.length - MAX_LISTED_ROOTS} 件`
++    : shown;
++}
++
++function describeHttpFailure(
++  ctx: MediaToolFailureContext,
++  error: MediaFetchError,
++): Error | undefined {
++  const status = error.status;
++  if (error.code === "http_error" && typeof status === "number") {
++    const stage = `URL の取得、HTTP ${status}`;
++    if (status === 401 || status === 403) {
++      return failure(
++        ctx,
++        stage,
++        [
++          `この URL は認証が必要か、アクセス権がないため取得できません。${ctx.toolName} ツールは認証情報を送れないので、同じ URL を試し直しても取得できません。`,
++          "次のどちらかを行ってください。",
++          `(1) Google Drive など認証が要る置き場のファイルは、認証付きで取得できる道具があればそれで作業場（workspace）に保存し、作業場の中のパスを ${ctx.toolName} ツールに渡す。`,
++          `(2) そのような道具が無い場合は、利用者に、${ctx.noun}そのものの添付か、リンクの共有設定を開くこと（権限を付けること）を頼む。`,
++        ],
++        error,
++        { status },
++      );
++    }
++    if (status === 404 || status === 410) {
++      return failure(
++        ctx,
++        stage,
++        [
++          `指定の URL に${ctx.noun}が見つかりませんでした。URL が違うか、削除・移動された可能性があります。`,
++          `URL を確かめられない場合は、利用者に、正しい URL か、${ctx.noun}そのものの添付を頼んでください。`,
++        ],
++        error,
++        { status },
++      );
++    }
++    if (status >= 500) {
++      return failure(
++        ctx,
++        stage,
++        [
++          "相手のサーバー側の問題で取得できませんでした。一時的な不具合の可能性があるので、試し直すのは 1 回までにしてください。",
++          `それでも取れない場合は、利用者に状況を伝え、${ctx.noun}そのものの添付を頼んでください。`,
++        ],
++        error,
++        { status },
++      );
++    }
++    return failure(
++      ctx,
++      stage,
++      [
++        "相手のサーバーに取得を断られました。同じ URL を試し直しても結果は変わりません。",
++        `利用者に、正しい URL か、${ctx.noun}そのものの添付を頼んでください。`,
++      ],
++      error,
++      { status },
++    );
++  }
++  if (error.code === "fetch_failed") {
++    const reason = error.message
++      .replace(/^Failed to fetch media from \S+?:\s+/, "")
++      .replace(/https?:\/\/\S+/gi, "<URL>")
++      .slice(0, 200);
++    return failure(
++      ctx,
++      "URL の取得",
++      [
++        `URL に接続できないか、応答を最後まで受け取れませんでした（理由: ${reason}）。`,
++        `利用者に、${ctx.noun}そのものの添付を頼むか、URL が正しいか確かめてもらってください。`,
++      ],
++      error,
++    );
++  }
++  return undefined;
++}
++
++function describeLocalFailure(
++  ctx: MediaToolFailureContext,
++  error: LocalMediaAccessError,
++): Error | undefined {
++  if (error.code === "path-not-allowed") {
++    return failure(
++      ctx,
++      "ローカルファイルの読み取り",
++      [
++        "指定されたファイルは、読み取りを許可された場所の外にあるため開けません。",
++        `許可されている場所: ${listRoots(ctx.allowedRoots)}`,
++        `次のどちらかを行ってください。(1) ファイルを許可された場所（作業場など）へ移すかコピーして、その中のパスを ${ctx.toolName} ツールに渡す。(2) ファイルが手元に無い場合は、利用者に ${ctx.noun}そのものの添付を頼む。`,
++      ],
++      error,
++      { tag: "Local media path is not under an allowed directory" },
++    );
++  }
++  if (error.code === "not-found") {
++    return failure(
++      ctx,
++      "ローカルファイルの読み取り",
++      [
++        "指定のパスにファイルがありません。パスが違うか、まだ保存されていない可能性があります。",
++        `パスを確かめてもファイルが無い場合は、利用者に ${ctx.noun}そのものの添付を頼んでください。`,
++      ],
++      error,
++    );
++  }
++  return undefined;
++}
++
++/** The error to throw for a failed media load: Japanese guidance, or the original error when not recognized. */
++export function toMediaToolFailure(ctx: MediaToolFailureContext, error: unknown): unknown {
++  if (ctx.signal?.aborted || isAbortError(error)) {
++    return error;
++  }
++  if (error instanceof MediaFetchError) {
++    return describeHttpFailure(ctx, error) ?? error;
++  }
++  if (error instanceof LocalMediaAccessError) {
++    return describeLocalFailure(ctx, error) ?? error;
++  }
++  return error;
++}
++
++/** Runs one media load and rethrows its failure as model-facing Japanese text. */
++export async function explainMediaToolFailure<T>(
++  ctx: MediaToolFailureContext,
++  load: () => Promise<T>,
++): Promise<T> {
++  try {
++    return await load();
++  } catch (error) {
++    throw toMediaToolFailure(ctx, error);
++  }
++}
++
++/** The error for content that loaded but is not the expected kind (stage: content type). */
++export function buildNotPdfFailure(
++  ctx: MediaToolFailureContext,
++  contentType: string | undefined,
++): Error {
++  const type = contentType && /^[\w.+-]+\/[\w.+-]+$/.test(contentType) ? contentType : "不明";
++  return failure(
++    ctx,
++    "内容の種類の確認",
++    [
++      `取得できたものは PDF ではありませんでした（種類: ${type}）。ログイン画面やエラーページを受け取った可能性があります。`,
++      `URL なら、認証が要る置き場のため別のページが返っているかもしれません。利用者に、${ctx.noun}そのものの添付を頼んでください。`,
++    ],
++    new Error(`Expected PDF but got ${type}`),
++    { tag: `Expected PDF but got ${type}` },
++  );
++}
+diff --git a/src/agents/tools/media-tool-failure.test.ts b/src/agents/tools/media-tool-failure.test.ts
+new file mode 100644
+index 000000000..4ebb6a1b9
+--- /dev/null
++++ b/src/agents/tools/media-tool-failure.test.ts
+@@ -0,0 +1,169 @@
++// Covers the model-facing Japanese failure texts for media-loading tools.
++import { describe, expect, it } from "vitest";
++import { MediaFetchError } from "../../media/fetch.js";
++import { LocalMediaAccessError } from "../../media/local-media-access.js";
++import { readToolOperatorHint } from "../tool-operator-hint.js";
++import {
++  buildNotPdfFailure,
++  explainMediaToolFailure,
++  toMediaToolFailure,
++} from "./media-tool-failure.js";
++
++const ctx = (extra: Record<string, unknown> = {}) => ({
++  toolName: "pdf",
++  noun: "PDF ファイル",
++  ...extra,
++});
++
++const httpError = (status: number, body = "secret-body") =>
++  new MediaFetchError(
++    "http_error",
++    `Failed to fetch media from https://files.example.invalid/private/a.pdf?sig=abc: HTTP ${status}; body: ${body}`,
++    { status },
++  );
++
++const textOf = (error: unknown) => (error as Error).message;
++
++describe("toMediaToolFailure: URL fetch", () => {
++  it.each([401, 403])(
++    "HTTP %i: says where it failed, how to open it, and what to ask the customer",
++    (status) => {
++      const error = toMediaToolFailure(ctx(), httpError(status)) as Error & { status?: number };
++      const text = error.message;
++      expect(text).toContain("pdf ツールで失敗しました（段階: URL の取得");
++      expect(text).toContain(`HTTP ${status}`);
++      expect(text).toContain("認証が必要");
++      expect(text).toContain("認証情報を送れない");
++      expect(text).toContain("認証付きで取得できる道具");
++      expect(text).toContain("作業場（workspace）に保存し、作業場の中のパスを pdf ツールに渡す");
++      expect(text).toContain("利用者に");
++      expect(text).toContain("添付");
++      expect(text).toContain("共有設定を開く");
++      expect(text).toContain("利用者はこちらの内部の状況を知りません");
++      expect(error.status).toBe(status);
++    },
++  );
++
++  it("keeps URL, query, origin body and credentials out of the text", () => {
++    for (const status of [401, 403, 404, 410, 418, 500, 503]) {
++      const text = textOf(toMediaToolFailure(ctx(), httpError(status)));
++      expect(text, String(status)).not.toMatch(/files\.example|sig=abc|secret-body|https?:\/\//);
++    }
++  });
++
++  it("HTTP 404, 5xx and other 4xx each name the stage and ask the customer for the file", () => {
++    for (const [status, phrase] of [
++      [404, "見つかりませんでした"],
++      [503, "試し直すのは 1 回まで"],
++      [418, "断られました"],
++    ] as const) {
++      const text = textOf(toMediaToolFailure(ctx(), httpError(status)));
++      expect(text).toContain(`段階: URL の取得、HTTP ${status}`);
++      expect(text).toContain(phrase);
++      expect(text).toContain("添付");
++    }
++  });
++
++  it("a network failure carries a URL-free reason", () => {
++    const original = new MediaFetchError(
++      "fetch_failed",
++      "Failed to fetch media from https://files.example.invalid/x.pdf: connect ECONNREFUSED https://10.0.0.1:443/x",
++    );
++    const text = textOf(toMediaToolFailure(ctx(), original));
++    expect(text).toContain("段階: URL の取得）");
++    expect(text).toContain("理由: connect ECONNREFUSED <URL>");
++    expect(text).not.toMatch(/example\.invalid|10\.0\.0\.1/);
++  });
++
++  it("uses the tool's own name and noun", () => {
++    const text = textOf(
++      toMediaToolFailure(ctx({ toolName: "view_image", noun: "画像ファイル" }), httpError(401)),
++    );
++    expect(text).toContain("view_image ツールで失敗しました");
++    expect(text).toContain("画像ファイルそのものの添付");
++    expect(text).not.toContain("PDF");
++  });
++});
++
++describe("toMediaToolFailure: local file", () => {
++  const denied = () =>
++    new LocalMediaAccessError(
++      "path-not-allowed",
++      "Local media path is not under an allowed directory: /home/secret-user/private/report.pdf",
++    );
++
++  it("lists the allowed roots and the remedy, without repeating the denied path", () => {
++    const roots = ["/state/workspace", "/tmp/openclaw", "/state/media"];
++    const error = toMediaToolFailure(ctx({ allowedRoots: roots }), denied());
++    const text = textOf(error);
++    expect(text).toContain("pdf ツールで失敗しました（段階: ローカルファイルの読み取り）");
++    expect(text).toContain("許可されている場所: /state/workspace、/tmp/openclaw、/state/media");
++    expect(text).toContain("移すかコピーして");
++    expect(text).toContain("添付を頼む");
++    expect(text).toContain("利用者はこちらの内部の状況を知りません");
++    expect(text).toContain("Local media path is not under an allowed directory");
++    expect(text).not.toMatch(/secret-user|report\.pdf/);
++  });
++
++  it("shortens a long root list and falls back to the workspace when no roots are known", () => {
++    const many = Array.from({ length: 11 }, (_, i) => `/root/${i}`);
++    expect(textOf(toMediaToolFailure(ctx({ allowedRoots: many }), denied()))).toContain(
++      "/root/7 ほか 3 件",
++    );
++    expect(textOf(toMediaToolFailure(ctx(), denied()))).toContain(
++      "許可されている場所: 作業場（workspace）の中",
++    );
++  });
++
++  it("explains a missing file; other local errors pass through untouched", () => {
++    const missing = new LocalMediaAccessError("not-found", "Local media file not found: /x/y.pdf");
++    const text = textOf(toMediaToolFailure(ctx(), missing));
++    expect(text).toContain("指定のパスにファイルがありません");
++    expect(text).not.toContain("/x/y.pdf");
++    const unsafe = new LocalMediaAccessError(
++      "invalid-path",
++      "Local media path is not safe to read: /x",
++    );
++    expect(toMediaToolFailure(ctx(), unsafe)).toBe(unsafe);
++  });
++});
++
++describe("pass-through and helpers", () => {
++  it("returns aborts, unknown errors and non-errors unchanged", () => {
++    const abort = Object.assign(new Error("aborted"), { name: "AbortError" });
++    const plain = new Error("something else");
++    expect(toMediaToolFailure(ctx(), abort)).toBe(abort);
++    expect(toMediaToolFailure(ctx(), plain)).toBe(plain);
++    expect(toMediaToolFailure(ctx(), "text")).toBe("text");
++    const controller = new AbortController();
++    controller.abort();
++    const http = httpError(401);
++    expect(toMediaToolFailure(ctx({ signal: controller.signal }), http)).toBe(http);
++  });
++
++  it("keeps the original error as cause and as an operator-only hint", () => {
++    const original = httpError(401);
++    const error = toMediaToolFailure(ctx(), original) as Error;
++    expect(error.cause).toBe(original);
++    expect(readToolOperatorHint(error)).toContain("HTTP 401");
++    expect(error.message).not.toContain("original error");
++  });
++
++  it("explainMediaToolFailure passes results through and rethrows failures as text", async () => {
++    await expect(explainMediaToolFailure(ctx(), async () => "ok")).resolves.toBe("ok");
++    await expect(
++      explainMediaToolFailure(ctx(), async () => {
++        throw httpError(403);
++      }),
++    ).rejects.toThrow("pdf ツールで失敗しました（段階: URL の取得、HTTP 403）");
++  });
++
++  it("describes content that is not a PDF (stage: content type) without the reference", () => {
++    const text = buildNotPdfFailure(ctx(), "text/html").message;
++    expect(text).toContain("段階: 内容の種類の確認");
++    expect(text).toContain("PDF ではありませんでした（種類: text/html）");
++    expect(text).toContain("Expected PDF but got text/html");
++    expect(buildNotPdfFailure(ctx(), "x y; z").message).toContain("種類: 不明");
++    expect(buildNotPdfFailure(ctx(), undefined).message).toContain("種類: 不明");
++  });
++});

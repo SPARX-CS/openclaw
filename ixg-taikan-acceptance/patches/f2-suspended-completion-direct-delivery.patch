@@ -1,0 +1,1141 @@
+f2: 起こせない requester の子の結果を、黙って捨てずに会話へ直接届ける（A = v2026.9.6+base_series / B = v2026.9.7 の両方に同じ patch が当たる）
+
+WHY   子 task（subagent）が終わっても requester の agent を起こせないと、行は `suspended` のまま 7 日＋約 32 分で
+      `discarded(expired)` になり、ユーザーには何も届かなかった（#3 F2.2/F2.2b/F2.3/F2.5）。
+WHAT  settle-wake が尽きた（行が suspended のまま wake の持ち主が無い）後、sweeper の次の tick（約 1 分以内）で:
+        1. 子の結果（本文＋ MEDIA: の添付）を requesterOrigin の宛先（channel / to / accountId / threadId）へ直接送り、
+           requester session の transcript にも mirror する（sendMessage の mirror）。
+        2. 直接送れない／失敗した時だけ、短い日本語で「「{依頼}」の作業は終わりましたが、結果をこの会話へお届けできませんでした
+           （{理由}）。{次の手}」と知らせる。宛先が無い時は requester session の記録（transcript）へ書く。
+        3. 7 日の discard は backstop: まだ何も届いていなければ discard の直前に 1→2 をもう一度試す。
+      `delivery.fallback`（永続）の印で、tick・再試行・restart をまたいでも結果も通知も 1 回だけ。送信前に印を書き、
+      中断された送信は「届いたか確認できない」と知らせて再送しない。待ち時間・再試行の窓・設定キーは変えない
+      （送信 1 回の上限は既存の agents.defaults.subagents.announceTimeoutMs）。
+HOW   registry/subagent-registry-suspended-fallback.ts（新）・registry/subagent-registry-suspended-delivery.ts（判定・runner・
+      discard の ensureFinalOutcome）・registry/subagent-registry-sweeper.ts（呼び出し 2 行）・
+      registry/subagent-registry-read.types.ts（`delivery.fallback` の型）。単体試験は registry/subagent-registry-suspended-fallback.test.ts。
+diff --git a/src/agents/subagents/registry/subagent-registry-read.types.ts b/src/agents/subagents/registry/subagent-registry-read.types.ts
+index 50d3b85c4..8234b4f7f 100644
+--- a/src/agents/subagents/registry/subagent-registry-read.types.ts
++++ b/src/agents/subagents/registry/subagent-registry-read.types.ts
+@@ -82,6 +82,35 @@ export type SubagentCompletionDeliveryState = {
+     | "message_tool_delivery_missing"
+     | "dedupe"
+     | "waiting_for_requester_turn";
++  /**
++   * Last-resort direct delivery of a suspended completion (see
++   * subagent-registry-suspended-fallback.ts). These markers keep it idempotent
++   * across retries and restarts.
++   */
++  fallback?: SubagentSuspendedFallbackState;
++};
++
++/** What the last-resort path has already done for one suspension of a completion. */
++export type SubagentSuspendedFallbackState = {
++  /** `delivery.suspendedAt` this state belongs to; a newer suspension starts over. */
++  forSuspendedAt?: number;
++  attemptCount?: number;
++  lastAttemptAt?: number;
++  /** Backoff after an attempt that neither delivered the result nor told the user. */
++  nextAttemptAt?: number;
++  /** Written before platform I/O so an interrupted send is reported, never repeated blindly. */
++  resultAttemptAt?: number;
++  /** The result (text and media) was sent to the requester's conversation. */
++  resultSentAt?: number;
++  /** The user was told in plain words that the result could not be delivered. */
++  noticeSentAt?: number;
++  failureClass?:
++    | "no_destination"
++    | "empty"
++    | "send_failed"
++    | "suppressed"
++    | "unconfirmed"
++    | "partial";
+ };
+ 
+ export type SwarmCollectorStatus = "done" | "failed" | "killed" | "timeout";
+diff --git a/src/agents/subagents/registry/subagent-registry-suspended-delivery.ts b/src/agents/subagents/registry/subagent-registry-suspended-delivery.ts
+index acf931453..cc64dd6dd 100644
+--- a/src/agents/subagents/registry/subagent-registry-suspended-delivery.ts
++++ b/src/agents/subagents/registry/subagent-registry-suspended-delivery.ts
+@@ -1,3 +1,4 @@
++import { createLazyImportLoader } from "../../../shared/lazy-promise.js";
+ import { isDeliverySuspended } from "./subagent-delivery-state.js";
+ import {
+   SUBAGENT_ENDED_REASON_COMPLETE,
+@@ -6,15 +7,112 @@ import {
+ import { shouldSuppressSubagentRecoverySessionEffects } from "./subagent-recovery-state.js";
+ import { safeRemoveAttachmentsDir } from "./subagent-registry-helpers.js";
+ import type { SubagentLifecycleController } from "./subagent-registry-lifecycle.js";
++import type { SubagentSuspendedFallbackState } from "./subagent-registry-read.types.js";
+ import type { SubagentRunRecord } from "./subagent-registry.types.js";
+ 
+ const SUBAGENT_SUSPENDED_DELIVERY_RETENTION_MS = 7 * 24 * 60 * 60_000;
+ const SUBAGENT_SUSPENDED_DELIVERY_WARNING_COUNT = 25;
++const SUBAGENT_SUSPENDED_FALLBACK_BACKSTOP_TIMEOUT_MS = 3 * 60_000;
++// Loaded on first use: the last-resort delivery pulls in the outbound send stack.
++const suspendedFallbackLoader = createLazyImportLoader(
++  () => import("./subagent-registry-suspended-fallback.js"),
++);
+ 
+ export function isSuspendedPendingFinalDelivery(entry: SubagentRunRecord): boolean {
+   return typeof entry.execution.endedAt === "number" && isDeliverySuspended(entry);
+ }
+ 
++/** A suspended completion that is owed to a user's conversation (not to another agent or an operator). */
++export function isSuspendedFinalFallbackEligible(entry: SubagentRunRecord): boolean {
++  return (
++    entry.expectsCompletionMessage === true &&
++    isSuspendedPendingFinalDelivery(entry) &&
++    entry.delivery?.disposition !== "intentional_non_delivery" &&
++    entry.completionTarget !== "parent" &&
++    entry.suppressCompletionDelivery !== true &&
++    entry.pauseReason !== "sessions_yield" &&
++    !entry.collect &&
++    // The requester-settle wake owns the row until it is exhausted.
++    !entry.requesterSettleWake
++  );
++}
++
++/** Markers of the last-resort delivery for this suspension; reading never writes to the row. */
++export function peekSuspendedFallbackState(
++  entry: SubagentRunRecord,
++): SubagentSuspendedFallbackState {
++  const delivery = entry.delivery;
++  // A later suspension (for example after an operator redrive) starts from a clean slate.
++  return delivery?.fallback && delivery.fallback.forSuspendedAt === delivery.suspendedAt
++    ? delivery.fallback
++    : {};
++}
++
++/** The result was sent, or the user was told it could not be (a partial send still owes the notice). */
++export function isSuspendedFallbackFinished(state: SubagentSuspendedFallbackState): boolean {
++  return (
++    state.noticeSentAt !== undefined ||
++    (state.resultSentAt !== undefined && state.failureClass !== "partial")
++  );
++}
++
++/** Cheap sweep-time check: does the last-resort delivery still owe something and is its backoff over? */
++export function isSuspendedFinalFallbackDue(entry: SubagentRunRecord, now: number): boolean {
++  const state = peekSuspendedFallbackState(entry);
++  return (
++    isSuspendedFinalFallbackEligible(entry) &&
++    !isSuspendedFallbackFinished(state) &&
++    (state.nextAttemptAt ?? 0) <= now
++  );
++}
++
++/**
++ * Delivers a suspended result to the requester's conversation, or tells the user (see the fallback
++ * module). The expiry backstop is awaited, bounded, so the row is not discarded mid-send; a hung
++ * channel must never stall the sweep.
++ */
++export async function runSuspendedFinalFallback(params: {
++  entry: SubagentRunRecord;
++  runs: ReadonlyMap<string, SubagentRunRecord>;
++  persist: (...runIds: string[]) => void;
++  warn: (message: string, meta?: Record<string, unknown>) => void;
++  backstop?: boolean;
++}): Promise<void> {
++  const { entry, backstop = false } = params;
++  let timer: NodeJS.Timeout | undefined;
++  try {
++    const { deliverSuspendedFinalFallback } = await suspendedFallbackLoader.load();
++    const attempt = deliverSuspendedFinalFallback({
++      entry,
++      runs: params.runs,
++      persist: params.persist,
++      backstop,
++    });
++    const outcome = backstop
++      ? await Promise.race([
++          attempt,
++          new Promise<"timeout">((resolve) => {
++            timer = setTimeout(
++              () => resolve("timeout"),
++              SUBAGENT_SUSPENDED_FALLBACK_BACKSTOP_TIMEOUT_MS,
++            );
++            timer.unref?.();
++          }),
++        ])
++      : await attempt;
++    if (backstop && (outcome === "pending" || outcome === "timeout")) {
++      params.warn("subagent suspended delivery reached its expiry without reaching the user", {
++        runId: entry.runId,
++        requesterSessionKey: entry.requesterSessionKey,
++      });
++    }
++  } catch (error) {
++    params.warn("subagent suspended delivery fallback failed", { runId: entry.runId, error });
++  } finally {
++    clearTimeout(timer);
++  }
++}
++
+ /** Report delivery backlog changes independently of admission for new work. */
+ export function warnSuspendedDeliveryPressure(
+   entries: Iterable<SubagentRunRecord>,
+@@ -69,8 +167,25 @@ export async function discardSuspendedPendingFinalDelivery(params: {
+     sendFarewell: true;
+   }) => Promise<void>;
+   warn: (message: string, meta?: Record<string, unknown>) => void;
++  /** Last chance to deliver the result or tell the user before it is discarded (idempotent). */
++  ensureFinalOutcome?: (entry: SubagentRunRecord) => Promise<void>;
+ }): Promise<void> {
+   const { runId, entry, now, reason, resumedRuns } = params;
++  if (params.ensureFinalOutcome) {
++    try {
++      await params.ensureFinalOutcome(entry);
++    } catch (error) {
++      params.warn("subagent suspended delivery fallback failed before discard", {
++        runId: entry.runId,
++        error,
++      });
++    }
++    // The fallback awaited platform I/O; another owner may have settled the row meanwhile.
++    if (!isSuspendedPendingFinalDelivery(entry)) {
++      return;
++    }
++  }
++  const fallback = entry.delivery?.fallback;
+   const snapshot = structuredClone(entry);
+   const wasResumed = resumedRuns.has(runId);
+   params.discardTerminalDelivery(entry, now, reason);
+@@ -102,6 +217,10 @@ export async function discardSuspendedPendingFinalDelivery(params: {
+     runId: entry.runId,
+     childSessionKey: entry.childSessionKey,
+     requesterSessionKey: entry.requesterSessionKey,
++    // How the result reached (or was reported to) the user before this retention ended.
++    ...(fallback?.resultSentAt !== undefined || fallback?.noticeSentAt !== undefined
++      ? { fallback: fallback.noticeSentAt !== undefined ? "notice_sent" : "result_sent" }
++      : {}),
+   });
+   if (entry.cleanup === "delete" || !entry.retainAttachmentsOnKeep) {
+     await safeRemoveAttachmentsDir(entry);
+diff --git a/src/agents/subagents/registry/subagent-registry-sweeper.ts b/src/agents/subagents/registry/subagent-registry-sweeper.ts
+index 6f80447a5..bfa35da01 100644
+--- a/src/agents/subagents/registry/subagent-registry-sweeper.ts
++++ b/src/agents/subagents/registry/subagent-registry-sweeper.ts
+@@ -22,8 +22,10 @@ import { createInterruptedRecoveryCoordinator } from "./subagent-registry-restar
+ import { isRestoredQueuedFailureSettlementClaimed } from "./subagent-registry-restore.js";
+ import {
+   discardSuspendedPendingFinalDelivery,
++  isSuspendedFinalFallbackDue,
+   isSuspendedPendingFinalDelivery,
+   resolveSuspendedDeliveryExpiryMs,
++  runSuspendedFinalFallback,
+   warnSuspendedDeliveryPressure,
+ } from "./subagent-registry-suspended-delivery.js";
+ import {
+@@ -151,6 +153,15 @@ export function createSubagentRegistrySweeper(params: {
+     warn: params.warn,
+   });
+ 
++  const runFinalFallback = (entry: SubagentRunRecord, backstop = false) =>
++    runSuspendedFinalFallback({
++      entry,
++      runs,
++      persist: params.persist,
++      warn: params.warn,
++      backstop,
++    });
++
+   function runCleanupTail(runId: string, label: string, run: () => Promise<unknown>) {
+     void runWithGatewayIndependentRootWorkAdmission(run, "subagents:sweeper-cleanup").catch(
+       (error: unknown) => params.warn(`subagent sweep ${label} failed`, { runId, error }),
+@@ -302,6 +313,7 @@ export function createSubagentRegistrySweeper(params: {
+               entry,
+               now,
+               reason: "expired",
++              ensureFinalOutcome: (candidate) => runFinalFallback(candidate, true),
+               resumedRuns,
+               clearPendingLifecycleError: params.clearPendingLifecycleError,
+               clearPendingLifecycleTimeout: params.clearPendingLifecycleTimeout,
+@@ -312,6 +324,10 @@ export function createSubagentRegistrySweeper(params: {
+               warn: params.warn,
+             });
+             mutatedRunIds.add(runId);
++          } else if (isSuspendedFinalFallbackDue(entry, now)) {
++            // The wake path is finished (it owns the row while requesterSettleWake is set): try the
++            // requester's conversation directly, then tell the user, instead of waiting for expiry.
++            runCleanupTail(runId, "suspended delivery fallback", () => runFinalFallback(entry));
+           }
+           continue;
+         }
+diff --git a/src/agents/subagents/registry/subagent-registry-suspended-fallback.ts b/src/agents/subagents/registry/subagent-registry-suspended-fallback.ts
+new file mode 100644
+index 000000000..9ed9e797c
+--- /dev/null
++++ b/src/agents/subagents/registry/subagent-registry-suspended-fallback.ts
+@@ -0,0 +1,452 @@
++/**
++ * Last resort for a required subagent completion whose requester could not be woken.
++ *
++ * The announce flow and the requester-settle wake both go through the requester AGENT. When that
++ * agent cannot run, the row ends up `suspended` and used to be discarded a week later with nobody
++ * told. This module runs once the wake path is finished (the sweeper calls it) and, in order:
++ *   1. sends the child's result (text and any MEDIA: attachments) straight to the requester's
++ *      conversation and mirrors it into the requester session's transcript;
++ *   2. only when that is impossible or fails, tells the user in plain Japanese which request it
++ *      was, that the result could not be delivered, why, and what to do next.
++ * Markers on `delivery.fallback` are written before and after platform I/O, so a retry, a sweeper
++ * tick or a restart never sends the result or the notice twice. Nothing here changes a timeout.
++ */
++import { truncateUtf16Safe } from "@openclaw/normalization-core/utf16-slice";
++import { sanitizePendingFinalDeliveryText } from "../../../auto-reply/reply/pending-final-delivery-state.js";
++import { appendAssistantMessageToSessionTranscript } from "../../../config/sessions/transcript.js";
++import { createSubsystemLogger } from "../../../logging/subsystem.js";
++import { isCronSessionKey } from "../../../sessions/session-key-utils.js";
++import { sanitizeAgentRunTerminalReplyText } from "../../agent-run-terminal-reply.js";
++import { resolveSubagentRequesterAgentId } from "../../subagent-requester-owner.js";
++import {
++  hasAnnounceSendEvidence,
++  resolveSubagentAnnounceTimeoutMs,
++  summarizeDeliveryError,
++} from "../announce/subagent-announce-delivery-retry.js";
++import {
++  getSubagentAnnounceRuntimeConfig,
++  loadRequesterSessionEntry,
++  resolveExternalBestEffortDeliveryTarget,
++  sendSubagentAnnounceMessage,
++} from "../announce/subagent-announce-delivery.runtime.js";
++import {
++  inferDeliveryTargetChatType,
++  resolveAnnounceOrigin,
++} from "../announce/subagent-announce-origin.js";
++import { resolveSubagentCompletionResultText } from "../completion/subagent-completion-result.js";
++import { getSubagentDepthFromSessionStore } from "../spawn/subagent-depth.js";
++import { ensureDeliveryState, isDeliverySuspended } from "./subagent-delivery-state.js";
++import type { SubagentSuspendedFallbackState } from "./subagent-registry-read.types.js";
++import {
++  isSuspendedFallbackFinished,
++  isSuspendedFinalFallbackEligible,
++  peekSuspendedFallbackState,
++} from "./subagent-registry-suspended-delivery.js";
++import type { SubagentRunRecord } from "./subagent-registry.types.js";
++
++const log = createSubsystemLogger("agents/subagent-registry");
++
++const RETRY_BASE_DELAY_MS = 5 * 60_000;
++const RETRY_MAX_DELAY_MS = 6 * 60 * 60_000;
++const REQUEST_SUMMARY_MAX_CHARS = 40;
++
++type FailureClass = NonNullable<SubagentSuspendedFallbackState["failureClass"]>;
++type SendOutcome = "sent" | "suppressed" | "unconfirmed" | "partial" | "failed";
++
++export type SuspendedFinalFallbackOutcome =
++  /** Not a suspended user-facing completion (or it belongs to another owner). */
++  | "skipped"
++  /** An attempt is running or backing off. */
++  | "waiting"
++  /** The result or the notice was already sent earlier. */
++  | "done"
++  | "result_sent"
++  | "notice_sent"
++  /** Neither the result nor the notice could be sent; it will be retried. */
++  | "pending";
++
++const inFlight = new Set<string>();
++/** Rows whose requester is another agent: nothing to tell a user. Process-local, re-derived after a restart. */
++const notUserFacing = new WeakSet<SubagentRunRecord>();
++
++/** Plain-language reason, written for the person who asked (no ids, paths or internals). */
++const NOTICE_REASON: Record<FailureClass, string> = {
++  no_destination: "お届け先の会話を特定できませんでした",
++  empty: "報告できる結果の内容がありませんでした",
++  send_failed: "結果の送信に失敗しました",
++  suppressed: "送信先の設定により送信が見送られました",
++  unconfirmed: "送信の途中で処理が中断され、届いたかどうか確認できませんでした",
++  partial: "結果の一部しか送信できませんでした",
++};
++
++/** What the person can actually do next; never promises a retry the system does not perform. */
++const NOTICE_NEXT_STEP: Record<FailureClass, string> = {
++  no_destination:
++    "管理者に送信先の確認を依頼するか、この会話から同じ依頼をもう一度お送りください。",
++  empty: "依頼の内容をより具体的にして、もう一度お送りください。",
++  send_failed:
++    "お手数ですが、同じ依頼をもう一度お送りください。何度も届かない場合は、管理者に送信状況の確認を依頼してください。",
++  suppressed: "結果が必要な場合は、管理者に送信設定の確認を依頼してください。",
++  unconfirmed: "届いていない場合は、同じ依頼をもう一度お送りください。",
++  partial: "届いていない部分が必要な場合は、その部分だけをもう一度ご依頼ください。",
++};
++
++/** Short, safe wording of the request: label first, then task; URLs, paths and key-like tokens dropped. */
++export function summarizeRequestForNotice(raw: string | undefined): string {
++  const cleaned = (raw ?? "")
++    .replace(/MEDIA:\S+/gi, " ")
++    .replace(/\bhttps?:\/\/\S+/gi, " ")
++    .replace(/(?:^|\s)(?:~|[A-Za-z]:\\|\/)\S*[\\/]\S*/g, " ")
++    .replace(/[A-Za-z0-9_\-+=]{24,}/g, " ")
++    .replace(/[「」\p{Cc}]+/gu, " ")
++    .replace(/\s+/g, " ")
++    .trim();
++  return cleaned.length > REQUEST_SUMMARY_MAX_CHARS
++    ? `${truncateUtf16Safe(cleaned, REQUEST_SUMMARY_MAX_CHARS - 1).trimEnd()}…`
++    : cleaned;
++}
++
++/** The notice: which request, that it finished, where delivery failed, why, and the next step. */
++export function buildSuspendedFinalNotice(params: {
++  requestSummary: string;
++  failureClass: FailureClass;
++  hasMedia?: boolean;
++}): string {
++  const subject = params.requestSummary ? `「${params.requestSummary}」の作業` : "ご依頼の作業";
++  const reason =
++    params.failureClass === "send_failed" && params.hasMedia
++      ? "画像などの添付を含む結果の送信に失敗しました"
++      : NOTICE_REASON[params.failureClass];
++  return `${subject}は終わりましたが、結果をこの会話へお届けできませんでした（${reason}）。${NOTICE_NEXT_STEP[params.failureClass]}`;
++}
++
++function writeState(entry: SubagentRunRecord, patch: Partial<SubagentSuspendedFallbackState>) {
++  const delivery = ensureDeliveryState(entry);
++  delivery.fallback = {
++    ...peekSuspendedFallbackState(entry),
++    ...patch,
++    forSuspendedAt: delivery.suspendedAt,
++  };
++}
++
++function resolveRetryDelayMs(attemptCount: number): number {
++  return Math.min(RETRY_MAX_DELAY_MS, RETRY_BASE_DELAY_MS * 2 ** Math.max(0, attemptCount - 1));
++}
++
++function resolveResultText(entry: SubagentRunRecord): string {
++  const payloadReply = entry.delivery?.payload?.terminalReply;
++  const raw =
++    resolveSubagentCompletionResultText(entry) ??
++    (entry.completion?.terminalReply === undefined && payloadReply?.disposition === "visible"
++      ? payloadReply.text
++      : undefined);
++  return sanitizeAgentRunTerminalReplyText(sanitizePendingFinalDeliveryText(raw ?? ""));
++}
++
++type SendContext = {
++  cfg: ReturnType<typeof getSubagentAnnounceRuntimeConfig>;
++  canonicalKey: string;
++  agentId?: string;
++  storePath?: string;
++  sessionId?: string;
++  target: ReturnType<typeof resolveExternalBestEffortDeliveryTarget>;
++};
++
++/** Where the requester's conversation is, from the row's requesterOrigin and the session's own route. */
++function resolveSendContext(entry: SubagentRunRecord): SendContext | undefined {
++  const cfg = getSubagentAnnounceRuntimeConfig();
++  const requesterAgentId = resolveSubagentRequesterAgentId(cfg, entry);
++  // Another agent (nested subagent, cron run) is the requester: there is no user conversation to tell.
++  if (
++    isCronSessionKey(entry.requesterSessionKey) ||
++    getSubagentDepthFromSessionStore(entry.requesterSessionKey, {
++      cfg,
++      agentId: requesterAgentId,
++    }) >= 1
++  ) {
++    return undefined;
++  }
++  const requester = loadRequesterSessionEntry(entry.requesterSessionKey, requesterAgentId);
++  const origin = resolveAnnounceOrigin(
++    requester.entry,
++    entry.delivery?.payload?.requesterOrigin ?? entry.requesterOrigin,
++  );
++  return {
++    cfg,
++    canonicalKey: requester.canonicalKey,
++    agentId: requester.agentId ?? requesterAgentId,
++    storePath: requester.storePath,
++    sessionId: requester.entry?.sessionId,
++    target: resolveExternalBestEffortDeliveryTarget({
++      channel: origin?.channel,
++      to: origin?.to,
++      accountId: origin?.accountId,
++      threadId: origin?.threadId,
++    }),
++  };
++}
++
++async function sendToRequester(
++  context: SendContext,
++  args: { content: string; idempotencyKey: string; onCommitted?: () => void },
++): Promise<{ outcome: SendOutcome; error?: string }> {
++  let committed = false;
++  try {
++    const sent = await sendSubagentAnnounceMessage({
++      cfg: context.cfg,
++      channel: context.target.channel,
++      to: context.target.to ?? "",
++      accountId: context.target.accountId,
++      threadId: context.target.threadId,
++      requesterSessionKey: context.canonicalKey,
++      ...(context.agentId ? { agentId: context.agentId } : {}),
++      conversationType: inferDeliveryTargetChatType({
++        channel: context.target.channel,
++        to: context.target.to,
++      }),
++      content: args.content,
++      idempotencyKey: args.idempotencyKey,
++      // Our own markers own retry and deduplication; a replayable queue entry would send it twice.
++      skipQueue: true,
++      // The existing announce timeout (agents.defaults.subagents.announceTimeoutMs) bounds each send.
++      abortSignal: AbortSignal.timeout(resolveSubagentAnnounceTimeoutMs(context.cfg)),
++      onDeliveryResult: () => {
++        if (!committed) {
++          committed = true;
++          args.onCommitted?.();
++        }
++      },
++      // Records the delivered message in the requester session's transcript.
++      mirror: {
++        sessionKey: context.canonicalKey,
++        ...(context.agentId ? { agentId: context.agentId } : {}),
++        idempotencyKey: args.idempotencyKey,
++      },
++    });
++    if (committed) {
++      return { outcome: "sent" };
++    }
++    if (sent.deliveryStatus === "suppressed") {
++      return {
++        outcome:
++          sent.suppressionReason === "adapter_returned_no_identity" ? "unconfirmed" : "suppressed",
++      };
++    }
++    if (sent.deliveryStatus === "partial_failed") {
++      return { outcome: "partial", error: sent.error };
++    }
++    if (sent.deliveryStatus === "failed") {
++      return { outcome: sent.sentBeforeError ? "partial" : "failed", error: sent.error };
++    }
++    return { outcome: "sent" };
++  } catch (error) {
++    // Post-send bookkeeping must never turn an identified delivery into a second send.
++    if (committed) {
++      return { outcome: "sent" };
++    }
++    return {
++      outcome: hasAnnounceSendEvidence(error) ? "partial" : "failed",
++      error: summarizeDeliveryError(error),
++    };
++  }
++}
++
++/**
++ * Delivers the result of a suspended completion, or tells the user it could not be delivered.
++ * Safe to call repeatedly: an already delivered or announced row returns "done" without I/O.
++ * `backstop` (used right before the 7-day discard) ignores the retry backoff.
++ */
++export async function deliverSuspendedFinalFallback(params: {
++  entry: SubagentRunRecord;
++  runs: ReadonlyMap<string, SubagentRunRecord>;
++  persist: (...runIds: string[]) => void;
++  now?: number;
++  backstop?: boolean;
++}): Promise<SuspendedFinalFallbackOutcome> {
++  const { entry } = params;
++  if (!isSuspendedFinalFallbackEligible(entry)) {
++    return "skipped";
++  }
++  const now = params.now ?? Date.now();
++  const initial = peekSuspendedFallbackState(entry);
++  if (isSuspendedFallbackFinished(initial)) {
++    return "done";
++  }
++  if (!params.backstop && (initial.nextAttemptAt ?? 0) > now) {
++    return "waiting";
++  }
++  const lock = `${entry.runId}:${entry.delivery?.suspendedAt}`;
++  if (notUserFacing.has(entry)) {
++    return "skipped";
++  }
++  if (inFlight.has(lock)) {
++    return "waiting";
++  }
++  inFlight.add(lock);
++  try {
++    const outcome = await runAttempt({ ...params, now });
++    if (outcome === "skipped") {
++      notUserFacing.add(entry);
++    }
++    return outcome;
++  } finally {
++    inFlight.delete(lock);
++  }
++}
++
++async function runAttempt(params: {
++  entry: SubagentRunRecord;
++  runs: ReadonlyMap<string, SubagentRunRecord>;
++  persist: (...runIds: string[]) => void;
++  now: number;
++}): Promise<SuspendedFinalFallbackOutcome> {
++  const { entry, runs, now } = params;
++  const runId = entry.runId;
++  const isCurrent = () => runs.get(runId) === entry && isDeliverySuspended(entry);
++  const update = (patch: Partial<SubagentSuspendedFallbackState>) => {
++    writeState(entry, patch);
++    if (runs.get(runId) === entry) {
++      params.persist(runId);
++    }
++  };
++  // Retry bookkeeping is pointless right before the row is discarded (the backstop ignores backoff):
++  // only what was actually sent, or may have been, is recorded then, so a row nothing could be done
++  // for stays exactly as it was.
++  const bookkeep = (patch: Partial<SubagentSuspendedFallbackState>) => {
++    if (!params.backstop) {
++      update(patch);
++    }
++  };
++  const idempotencyBase = `subagent-suspended-final:${runId}:${entry.delivery?.suspendedAt ?? 0}`;
++  const before = { ...peekSuspendedFallbackState(entry) };
++  let context: SendContext | undefined;
++  try {
++    context = resolveSendContext(entry);
++  } catch (error) {
++    log.warn("subagent suspended delivery could not resolve the requester conversation", {
++      runId,
++      error: summarizeDeliveryError(error),
++    });
++    bookkeep({
++      attemptCount: (before.attemptCount ?? 0) + 1,
++      lastAttemptAt: now,
++      nextAttemptAt: now + resolveRetryDelayMs((before.attemptCount ?? 0) + 1),
++    });
++    return "pending";
++  }
++  if (!context) {
++    return "skipped";
++  }
++  bookkeep({ attemptCount: (before.attemptCount ?? 0) + 1, lastAttemptAt: now });
++  const payload = entry.delivery?.payload;
++  const resultText = resolveResultText(entry);
++  const hasMedia = /(?:^|\n)\s*MEDIA:/i.test(resultText);
++
++  let failure: FailureClass | undefined;
++  if (before.failureClass === "unconfirmed" || before.failureClass === "partial") {
++    // Both mean part of the result may already have reached the user; never send it again.
++    failure = before.failureClass;
++  } else if (before.resultAttemptAt !== undefined && before.resultSentAt === undefined) {
++    // An earlier process stopped between "about to send" and an outcome.
++    failure = "unconfirmed";
++  } else if (!context.target.deliver) {
++    failure = "no_destination";
++  } else if (!resultText) {
++    failure = "empty";
++  } else {
++    // 1. The result itself, to the requester's own conversation.
++    update({ resultAttemptAt: now, failureClass: undefined });
++    const result = await sendToRequester(context, {
++      content: resultText,
++      idempotencyKey: `${idempotencyBase}:result`,
++      onCommitted: () => update({ resultSentAt: Date.now(), resultAttemptAt: undefined }),
++    });
++    if (result.outcome === "sent") {
++      if (peekSuspendedFallbackState(entry).resultSentAt === undefined) {
++        update({ resultSentAt: Date.now() });
++      }
++      update({ resultAttemptAt: undefined, nextAttemptAt: undefined });
++      log.info("subagent suspended delivery sent directly to the requester conversation", {
++        runId,
++        hasMedia,
++      });
++      return "result_sent";
++    }
++    update({ resultAttemptAt: undefined });
++    if (result.outcome === "partial") {
++      update({ resultSentAt: Date.now() });
++    }
++    failure =
++      result.outcome === "failed"
++        ? "send_failed"
++        : result.outcome === "partial"
++          ? "partial"
++          : result.outcome;
++    log.warn("subagent suspended delivery could not be sent directly", {
++      runId,
++      failure,
++      ...(result.error ? { error: result.error } : {}),
++    });
++  }
++
++  // 2. Tell the user, in plain words, that the result could not be delivered.
++  if (failure === "partial" || failure === "unconfirmed") {
++    update({ failureClass: failure }); // sticky: the result must never be sent again
++  } else {
++    bookkeep({ failureClass: failure });
++  }
++  if (!isCurrent()) {
++    return "waiting";
++  }
++  const notice = buildSuspendedFinalNotice({
++    requestSummary: summarizeRequestForNotice(
++      entry.label?.trim() || payload?.label?.trim() || payload?.task || entry.task,
++    ),
++    failureClass: failure,
++    hasMedia,
++  });
++  const noticeKey = `${idempotencyBase}:notice`;
++  const finishNotice = (sent: boolean): SuspendedFinalFallbackOutcome => {
++    if (sent) {
++      update({ noticeSentAt: Date.now(), nextAttemptAt: undefined });
++      log.info("subagent suspended delivery reported to the requester conversation", {
++        runId,
++        failure,
++      });
++      return "notice_sent";
++    }
++    bookkeep({
++      nextAttemptAt: now + resolveRetryDelayMs(peekSuspendedFallbackState(entry).attemptCount ?? 1),
++    });
++    return "pending";
++  };
++  if (context.target.deliver) {
++    const sent = await sendToRequester(context, { content: notice, idempotencyKey: noticeKey });
++    if (sent.outcome === "sent" || sent.outcome === "partial") {
++      return finishNotice(true);
++    }
++    // A channel that suppresses every send can still take the notice into the session record.
++    if (sent.outcome !== "suppressed") {
++      log.warn("subagent suspended delivery notice could not be sent", {
++        runId,
++        ...(sent.error ? { error: sent.error } : {}),
++      });
++      return finishNotice(false);
++    }
++  }
++  const recorded = await appendAssistantMessageToSessionTranscript({
++    ...(context.agentId ? { agentId: context.agentId } : {}),
++    sessionKey: context.canonicalKey,
++    ...(context.sessionId ? { expectedSessionId: context.sessionId } : {}),
++    ...(context.storePath ? { storePath: context.storePath } : {}),
++    text: notice,
++    idempotencyKey: noticeKey,
++  }).catch((error: unknown) => ({ ok: false as const, reason: summarizeDeliveryError(error) }));
++  if (!recorded.ok) {
++    log.warn("subagent suspended delivery notice could not be recorded", {
++      runId,
++      reason: recorded.reason,
++    });
++  }
++  return finishNotice(recorded.ok);
++}
+diff --git a/src/agents/subagents/registry/subagent-registry-suspended-fallback.test.ts b/src/agents/subagents/registry/subagent-registry-suspended-fallback.test.ts
+new file mode 100644
+index 000000000..61d40a201
+--- /dev/null
++++ b/src/agents/subagents/registry/subagent-registry-suspended-fallback.test.ts
+@@ -0,0 +1,412 @@
++import { beforeEach, describe, expect, it, vi } from "vitest";
++import { createSubagentRunRecord } from "../../subagent-test-fixtures.test-helpers.js";
++import {
++  discardSuspendedPendingFinalDelivery,
++  isSuspendedFinalFallbackDue,
++} from "./subagent-registry-suspended-delivery.js";
++import {
++  buildSuspendedFinalNotice,
++  deliverSuspendedFinalFallback,
++  summarizeRequestForNotice,
++} from "./subagent-registry-suspended-fallback.js";
++import type { SubagentRunRecord } from "./subagent-registry.types.js";
++
++const mocks = vi.hoisted(() => ({
++  sendMessage: vi.fn(),
++  appendTranscript: vi.fn(),
++  loadRequesterSessionEntry: vi.fn(),
++  depth: vi.fn(),
++}));
++
++vi.mock("../announce/subagent-announce-delivery.runtime.js", async (importOriginal) => ({
++  ...(await importOriginal<typeof import("../announce/subagent-announce-delivery.runtime.js")>()),
++  getSubagentAnnounceRuntimeConfig: () => ({}),
++  loadRequesterSessionEntry: mocks.loadRequesterSessionEntry,
++  sendSubagentAnnounceMessage: mocks.sendMessage,
++}));
++vi.mock("../../../config/sessions/transcript.js", async (importOriginal) => ({
++  ...(await importOriginal<typeof import("../../../config/sessions/transcript.js")>()),
++  appendAssistantMessageToSessionTranscript: mocks.appendTranscript,
++}));
++vi.mock("../spawn/subagent-depth.js", () => ({
++  getSubagentDepthFromSessionStore: mocks.depth,
++}));
++
++const REQUESTER = "agent:main:discord:dm:user-1";
++const SUSPENDED_AT = 1_700_000_000_000;
++const MEDIA_RESULT = "Generated 1 image.\nMEDIA:/tmp/f2-cat.png";
++
++function makeRow(overrides: Partial<SubagentRunRecord> = {}): SubagentRunRecord {
++  return createSubagentRunRecord({
++    runId: "run-fallback-1",
++    childSessionKey: "agent:main:subagent:fallback-1",
++    requesterSessionKey: REQUESTER,
++    requesterDisplayKey: "user-1",
++    requesterOrigin: { channel: "discord", to: "user:1", accountId: "acct-1", threadId: "t-9" },
++    label: "cat picture",
++    task: "draw a cat",
++    expectsCompletionMessage: true,
++    endedAt: SUSPENDED_AT - 60_000,
++    outcome: { status: "ok" },
++    completion: {
++      required: true,
++      terminalReply: { disposition: "visible", text: MEDIA_RESULT },
++    },
++    delivery: {
++      status: "suspended",
++      suspendedAt: SUSPENDED_AT,
++      suspendedReason: "expiry",
++      disposition: "permanent_failure",
++    },
++    ...overrides,
++  } as never);
++}
++
++/** The parameters of the n-th outbound send the fallback made. */
++function sentParams(index: number) {
++  return mocks.sendMessage.mock.calls[index]?.[0] as { content: string; mirror?: unknown };
++}
++
++function run(entry: SubagentRunRecord, options: { now?: number; backstop?: boolean } = {}) {
++  const runs = new Map([[entry.runId, entry]]);
++  const persist = vi.fn();
++  return {
++    persist,
++    runs,
++    outcome: deliverSuspendedFinalFallback({
++      entry,
++      runs,
++      persist,
++      now: options.now ?? SUSPENDED_AT + 40 * 60_000,
++      backstop: options.backstop,
++    }),
++  };
++}
++
++beforeEach(() => {
++  mocks.sendMessage.mockReset().mockResolvedValue({ deliveryStatus: "sent" });
++  mocks.appendTranscript.mockReset().mockResolvedValue({ ok: true });
++  mocks.depth.mockReset().mockReturnValue(0);
++  mocks.loadRequesterSessionEntry.mockReset().mockReturnValue({
++    cfg: {},
++    canonicalKey: REQUESTER,
++    agentId: "main",
++    storePath: "/state/sessions.json",
++    entry: { sessionId: "session-1" },
++  });
++});
++
++describe("suspended completion last-resort delivery", () => {
++  it("sends the result text and media straight to the requester's destination and mirrors it", async () => {
++    const entry = makeRow();
++    const { outcome, persist } = run(entry);
++    expect(await outcome).toBe("result_sent");
++    expect(mocks.sendMessage).toHaveBeenCalledTimes(1);
++    expect(mocks.sendMessage.mock.calls[0]?.[0]).toMatchObject({
++      channel: "discord",
++      to: "user:1",
++      accountId: "acct-1",
++      threadId: "t-9",
++      // The MEDIA: directive stays in the content; the outbound payload plan turns it into the attachment.
++      content: MEDIA_RESULT,
++      requesterSessionKey: REQUESTER,
++      agentId: "main",
++      skipQueue: true,
++      mirror: { sessionKey: REQUESTER, agentId: "main" },
++    });
++    expect(entry.delivery?.fallback).toMatchObject({
++      forSuspendedAt: SUSPENDED_AT,
++      attemptCount: 1,
++      resultSentAt: expect.any(Number),
++    });
++    expect(entry.delivery?.fallback?.resultAttemptAt).toBeUndefined();
++    expect(entry.delivery?.fallback?.noticeSentAt).toBeUndefined();
++    // The row stays suspended (the existing retention applies); the marker is persisted.
++    expect(entry.delivery?.status).toBe("suspended");
++    expect(persist).toHaveBeenCalledWith("run-fallback-1");
++  });
++
++  it("never sends twice: repeated ticks and a restored copy of the row do nothing", async () => {
++    const entry = makeRow();
++    expect(await run(entry).outcome).toBe("result_sent");
++    expect(await run(entry).outcome).toBe("done");
++    // A restart restores the row from its persisted payload.
++    const restored = structuredClone(entry);
++    expect(await run(restored, { backstop: true }).outcome).toBe("done");
++    expect(mocks.sendMessage).toHaveBeenCalledTimes(1);
++  });
++
++  it("tells the user in plain Japanese when the direct delivery fails, then never again", async () => {
++    mocks.sendMessage.mockImplementation(async (params: { content: string }) => {
++      if (params.content.includes("MEDIA:")) {
++        throw new Error("media not allowed");
++      }
++      return { deliveryStatus: "sent" };
++    });
++    const entry = makeRow();
++    expect(await run(entry).outcome).toBe("notice_sent");
++    expect(mocks.sendMessage).toHaveBeenCalledTimes(2);
++    const notice = sentParams(1);
++    expect(notice.content).toBe(
++      "「cat picture」の作業は終わりましたが、結果をこの会話へお届けできませんでした（画像などの添付を含む結果の送信に失敗しました）。お手数ですが、同じ依頼をもう一度お送りください。何度も届かない場合は、管理者に送信状況の確認を依頼してください。",
++    );
++    expect(notice.mirror).toMatchObject({ sessionKey: REQUESTER });
++    expect(entry.delivery?.fallback).toMatchObject({
++      failureClass: "send_failed",
++      noticeSentAt: expect.any(Number),
++    });
++    expect(await run(entry, { backstop: true }).outcome).toBe("done");
++    expect(mocks.sendMessage).toHaveBeenCalledTimes(2);
++  });
++
++  it("backs off while neither the result nor the notice can be sent, and the expiry backstop ignores the backoff", async () => {
++    mocks.sendMessage.mockRejectedValue(new Error("channel unavailable"));
++    const entry = makeRow();
++    const start = SUSPENDED_AT + 40 * 60_000;
++    expect(await run(entry, { now: start }).outcome).toBe("pending");
++    expect(mocks.sendMessage).toHaveBeenCalledTimes(2);
++    const retryAt = entry.delivery?.fallback?.nextAttemptAt;
++    expect(retryAt).toBeGreaterThan(start);
++    expect(isSuspendedFinalFallbackDue(entry, start + 1_000)).toBe(false);
++    expect(isSuspendedFinalFallbackDue(entry, retryAt ?? 0)).toBe(true);
++    // Within the backoff nothing is attempted ...
++    expect(await run(entry, { now: start + 1_000 }).outcome).toBe("waiting");
++    expect(mocks.sendMessage).toHaveBeenCalledTimes(2);
++    // ... but the backstop right before the discard tries again, result first.
++    mocks.sendMessage.mockReset().mockResolvedValue({ deliveryStatus: "sent" });
++    expect(await run(entry, { now: start + 2_000, backstop: true }).outcome).toBe("result_sent");
++    expect(mocks.sendMessage).toHaveBeenCalledTimes(1);
++    expect(entry.delivery?.fallback?.resultSentAt).toEqual(expect.any(Number));
++  });
++
++  it("leaves the row exactly as it was when the expiry backstop could do nothing", async () => {
++    mocks.sendMessage.mockRejectedValue(new Error("channel unavailable"));
++    mocks.appendTranscript.mockResolvedValue({ ok: false, reason: "session not found" });
++    const noRoute = makeRow({ requesterOrigin: undefined });
++    const noRouteBefore = structuredClone(noRoute);
++    expect(await run(noRoute, { backstop: true }).outcome).toBe("pending");
++    expect(noRoute).toEqual(noRouteBefore);
++    // With a destination the send is attempted (and recorded as attempted, then cleared), but no
++    // retry bookkeeping is added for a row that is about to be discarded.
++    const entry = makeRow();
++    expect(await run(entry, { backstop: true }).outcome).toBe("pending");
++    expect(mocks.sendMessage).toHaveBeenCalledTimes(2);
++    expect(entry.delivery?.fallback).toEqual({
++      forSuspendedAt: SUSPENDED_AT,
++      resultAttemptAt: undefined,
++    });
++  });
++
++  it("writes the notice to the session record when the conversation has no destination", async () => {
++    const entry = makeRow({ requesterOrigin: undefined });
++    mocks.loadRequesterSessionEntry.mockReturnValue({
++      cfg: {},
++      canonicalKey: REQUESTER,
++      agentId: "main",
++      storePath: "/state/sessions.json",
++      entry: { sessionId: "session-1" },
++    });
++    expect(await run(entry).outcome).toBe("notice_sent");
++    expect(mocks.sendMessage).not.toHaveBeenCalled();
++    expect(mocks.appendTranscript).toHaveBeenCalledTimes(1);
++    expect(mocks.appendTranscript.mock.calls[0]?.[0]).toMatchObject({
++      sessionKey: REQUESTER,
++      expectedSessionId: "session-1",
++      text: expect.stringContaining("お届け先の会話を特定できませんでした"),
++    });
++    expect(await run(entry).outcome).toBe("done");
++    expect(mocks.appendTranscript).toHaveBeenCalledTimes(1);
++  });
++
++  it("reports an empty result instead of sending nothing", async () => {
++    const entry = makeRow({ completion: { required: true } as never });
++    expect(await run(entry).outcome).toBe("notice_sent");
++    expect(mocks.sendMessage).toHaveBeenCalledTimes(1);
++    expect(sentParams(0).content).toContain("報告できる結果の内容がありませんでした");
++  });
++
++  it("does not repeat a send that an earlier process interrupted: it only reports that it is unconfirmed", async () => {
++    const entry = makeRow();
++    entry.delivery = {
++      ...entry.delivery!,
++      fallback: { forSuspendedAt: SUSPENDED_AT, attemptCount: 1, resultAttemptAt: SUSPENDED_AT },
++    };
++    expect(await run(entry).outcome).toBe("notice_sent");
++    expect(mocks.sendMessage).toHaveBeenCalledTimes(1);
++    expect(sentParams(0).content).toContain("届いたかどうか確認できませんでした");
++    expect(entry.delivery?.fallback?.failureClass).toBe("unconfirmed");
++  });
++
++  it("treats a partial send as delivered-in-part: no second result, one notice", async () => {
++    mocks.sendMessage.mockResolvedValueOnce({
++      deliveryStatus: "partial_failed",
++      error: "second payload failed",
++    });
++    const entry = makeRow();
++    expect(await run(entry).outcome).toBe("notice_sent");
++    expect(mocks.sendMessage).toHaveBeenCalledTimes(2);
++    expect(sentParams(1).content).toContain("一部しか送信できませんでした");
++    expect(await run(entry, { backstop: true }).outcome).toBe("done");
++    expect(mocks.sendMessage).toHaveBeenCalledTimes(2);
++  });
++
++  it("starts over for a newer suspension of the same row", async () => {
++    const entry = makeRow();
++    expect(await run(entry).outcome).toBe("result_sent");
++    entry.delivery = { ...entry.delivery!, suspendedAt: SUSPENDED_AT + 5_000 };
++    expect(await run(entry).outcome).toBe("result_sent");
++    expect(mocks.sendMessage).toHaveBeenCalledTimes(2);
++  });
++
++  it.each([
++    ["a private completion for a parent agent", { completionTarget: "parent" as const }],
++    [
++      "an intentional non-delivery",
++      {
++        delivery: {
++          status: "suspended",
++          suspendedAt: SUSPENDED_AT,
++          disposition: "intentional_non_delivery",
++        },
++      },
++    ],
++    ["a row that is not suspended", { delivery: { status: "pending" } }],
++    [
++      "a requester-settle wake still pending",
++      { requesterSettleWake: { status: "pending", attemptCount: 1 } },
++    ],
++    ["a completion nobody expects", { expectsCompletionMessage: false }],
++    ["a suppressed completion", { suppressCompletionDelivery: true }],
++  ])("leaves %s alone", async (_label, overrides) => {
++    const entry = makeRow(overrides as Partial<SubagentRunRecord>);
++    expect(await run(entry).outcome).toBe("skipped");
++    expect(isSuspendedFinalFallbackDue(entry, Date.now() + 1)).toBe(false);
++    expect(mocks.sendMessage).not.toHaveBeenCalled();
++    expect(mocks.appendTranscript).not.toHaveBeenCalled();
++  });
++
++  it("leaves a result owed to another agent alone (nested subagent or cron requester)", async () => {
++    mocks.depth.mockReturnValue(1);
++    const entry = makeRow();
++    expect(await run(entry).outcome).toBe("skipped");
++    expect(await run(entry).outcome).toBe("skipped");
++    expect(mocks.sendMessage).not.toHaveBeenCalled();
++    expect(entry.delivery?.fallback).toBeUndefined();
++  });
++});
++
++describe("notice wording", () => {
++  it("names the request, never ids, paths, URLs or keys, and stays short", () => {
++    expect(summarizeRequestForNotice("cat picture")).toBe("cat picture");
++    const summary = summarizeRequestForNotice(
++      "「見積書」を /home/user/secret/report.pdf と https://example.com/a?token=abc から作って sk-abcdefghijklmnopqrstuvwxyz0123456789 MEDIA:/tmp/x.png",
++    );
++    expect(summary).not.toMatch(/\/home|https?:|sk-abc|MEDIA|\/tmp|「|」/);
++    expect(summary.length).toBeLessThanOrEqual(40);
++    expect(summarizeRequestForNotice("あ".repeat(100))).toBe(`${"あ".repeat(39)}…`);
++    expect(summarizeRequestForNotice("   \n ")).toBe("");
++  });
++
++  it.each([
++    "no_destination",
++    "empty",
++    "send_failed",
++    "suppressed",
++    "unconfirmed",
++    "partial",
++  ] as const)(
++    "says which request, that it finished, where it failed, why and what next (%s)",
++    (failureClass) => {
++      const text = buildSuspendedFinalNotice({ requestSummary: "請求書の作成", failureClass });
++      expect(text).toMatch(
++        /^「請求書の作成」の作業は終わりましたが、結果をこの会話へお届けできませんでした（.+）。.{12,}$/s,
++      );
++      expect(text).not.toMatch(/agent:|run-|session|MEDIA|\/tmp/);
++      // The next step is concrete, never only "send it again".
++      expect(text.split("。")[1]?.replace(/\s/g, "")).not.toBe("もう一度お送りください");
++    },
++  );
++
++  it("falls back to a neutral subject when the request has no usable wording", () => {
++    expect(buildSuspendedFinalNotice({ requestSummary: "", failureClass: "send_failed" })).toMatch(
++      /^ご依頼の作業は終わりましたが、/,
++    );
++  });
++});
++
++describe("discard backstop", () => {
++  function discard(entry: SubagentRunRecord, ensureFinalOutcome?: () => Promise<void>) {
++    const warn = vi.fn();
++    const discardTerminalDelivery = vi.fn((candidate: SubagentRunRecord, now: number) => {
++      candidate.delivery = { status: "discarded", discardedAt: now, discardReason: "expired" };
++    });
++    const promise = discardSuspendedPendingFinalDelivery({
++      runId: entry.runId,
++      entry,
++      now: SUSPENDED_AT + 7 * 24 * 60 * 60_000,
++      reason: "expired",
++      resumedRuns: new Set(),
++      clearPendingLifecycleError: vi.fn(),
++      clearPendingLifecycleTimeout: vi.fn(),
++      discardTerminalDelivery: discardTerminalDelivery as never,
++      completeCleanupBookkeeping: vi.fn(),
++      shouldEmitEndedHookForRun: () => false,
++      emitSubagentEndedHookForRun: vi.fn(async () => {}),
++      warn,
++      ...(ensureFinalOutcome ? { ensureFinalOutcome } : {}),
++    });
++    return { promise, warn, discardTerminalDelivery };
++  }
++
++  it("gives the fallback a last chance before the row is discarded and says how it was served", async () => {
++    const entry = makeRow();
++    const order: string[] = [];
++    const { promise, warn, discardTerminalDelivery } = discard(entry, async () => {
++      order.push("fallback");
++      entry.delivery = {
++        ...entry.delivery!,
++        fallback: { forSuspendedAt: SUSPENDED_AT, resultSentAt: SUSPENDED_AT + 1 },
++      };
++    });
++    discardTerminalDelivery.mockImplementation((candidate) => {
++      order.push("discard");
++      candidate.delivery = { status: "discarded", discardReason: "expired" };
++    });
++    await promise;
++    expect(order).toEqual(["fallback", "discard"]);
++    expect(warn).toHaveBeenCalledWith(
++      "subagent suspended delivery discarded",
++      expect.objectContaining({ reason: "expired", fallback: "result_sent" }),
++    );
++  });
++
++  it("still discards when the fallback itself fails, and does not discard a row settled meanwhile", async () => {
++    const failing = discard(makeRow(), async () => {
++      throw new Error("boom");
++    });
++    await failing.promise;
++    expect(failing.warn).toHaveBeenCalledWith(
++      "subagent suspended delivery fallback failed before discard",
++      expect.objectContaining({ runId: "run-fallback-1" }),
++    );
++    expect(failing.discardTerminalDelivery).toHaveBeenCalledTimes(1);
++
++    const settled = makeRow();
++    const raced = discard(settled, async () => {
++      settled.delivery = { status: "delivered" };
++    });
++    await raced.promise;
++    expect(raced.discardTerminalDelivery).not.toHaveBeenCalled();
++  });
++
++  it("keeps the old behavior for rows without markers", async () => {
++    const { promise, warn } = discard(makeRow());
++    await promise;
++    expect(warn).toHaveBeenCalledWith("subagent suspended delivery discarded", {
++      reason: "expired",
++      runId: "run-fallback-1",
++      childSessionKey: "agent:main:subagent:fallback-1",
++      requesterSessionKey: REQUESTER,
++    });
++  });
++});

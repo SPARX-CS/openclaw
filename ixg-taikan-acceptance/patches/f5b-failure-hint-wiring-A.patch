@@ -1,0 +1,513 @@
+diff --git a/src/agents/agent-tool-definition-adapter.ts b/src/agents/agent-tool-definition-adapter.ts
+index b680ef7cb..247133a81 100644
+--- a/src/agents/agent-tool-definition-adapter.ts
++++ b/src/agents/agent-tool-definition-adapter.ts
+@@ -38,6 +38,12 @@ import {
+   getInternalToolExecutionPreparer,
+ } from "./runtime/internal-hooks.js";
+ import type { ToolDefinition } from "./sessions/index.js";
++import {
++  appendToolFailureHint,
++  isToolSuccessForFailureHint,
++  recordToolFailureForHint,
++  resetToolFailureStreak,
++} from "./tool-loop-failure-hint.js";
+ import { readToolOperatorHint } from "./tool-operator-hint.js";
+ import { normalizeToolPolicyName } from "./tool-policy.js";
+ import { jsonResult, payloadTextResult, ToolInputError } from "./tools/common.js";
+@@ -246,10 +252,14 @@ async function executeAdaptedToolOperation(params: {
+   hookContext: HookContext | undefined;
+ }): Promise<AgentToolResult<unknown>> {
+   try {
+-    return normalizeToolExecutionResult({
++    const result = normalizeToolExecutionResult({
+       toolName: params.normalizedToolName,
+       result: await params.run(),
+     });
++    if (isToolSuccessForFailureHint(result)) {
++      resetToolFailureStreak(params.hookContext, params.normalizedToolName);
++    }
++    return result;
+   } catch (err) {
+     if (params.signal?.aborted) {
+       throw err;
+@@ -277,10 +287,18 @@ async function executeAdaptedToolOperation(params: {
+     logError(
+       `[tools] ${params.normalizedToolName} failed: ${described.message}${operatorHint} ${inputPreview}`,
+     );
+-    return buildToolExecutionErrorResult({
++    const errorResult = buildToolExecutionErrorResult({
+       toolName: params.normalizedToolName,
+       message: described.message,
+     });
++    // Hint only (never a block): from the Nth failure of the same tool and kind, tell the model
++    // to switch approach or tell the user.
++    const failureHint = recordToolFailureForHint(
++      params.hookContext,
++      params.normalizedToolName,
++      err,
++    );
++    return failureHint ? appendToolFailureHint(errorResult, failureHint) : errorResult;
+   }
+ }
+ 
+diff --git a/src/agents/agent-tool-definition-adapter.test.ts b/src/agents/agent-tool-definition-adapter.test.ts
+index d9f79a934..312eb2216 100644
+--- a/src/agents/agent-tool-definition-adapter.test.ts
++++ b/src/agents/agent-tool-definition-adapter.test.ts
+@@ -8,8 +8,9 @@ import path from "node:path";
+ import { expectDefined } from "@openclaw/normalization-core";
+ import type { AgentTool } from "openclaw/plugin-sdk/agent-core";
+ import { Type } from "typebox";
+-import { describe, expect, it, vi } from "vitest";
++import { beforeEach, describe, expect, it, vi } from "vitest";
+ import { withTestTimeout } from "../../test/helpers/promise.js";
++import { resetDiagnosticSessionStateForTest } from "../logging/diagnostic-session-state.js";
+ import {
+   createClientToolNameConflictError,
+   findClientToolNameConflicts,
+@@ -418,6 +419,138 @@ describe("agent tool definition adapter", () => {
+   });
+ });
+ 
++describe("tool failure hint through the adapter", () => {
++  beforeEach(() => {
++    resetDiagnosticSessionStateForTest();
++  });
++
++  let sessionCounter = 0;
++  function createFlakyTool(outcomes: (call: number, args: { url?: string }) => Error | undefined) {
++    let calls = 0;
++    return {
++      name: "flaky_fetch",
++      label: "Flaky Fetch",
++      description: "fails or succeeds on demand",
++      parameters: Type.Object({ url: Type.Optional(Type.String()) }),
++      execute: async (_id: string, args: { url?: string }) => {
++        calls += 1;
++        const failure = outcomes(calls, args);
++        if (failure) {
++          throw failure;
++        }
++        return { content: [{ type: "text" as const, text: "fetched" }], details: { status: "ok" } };
++      },
++    } as unknown as AgentTool;
++  }
++
++  function embeddedDefinition(tool: AgentTool, config?: Record<string, unknown>) {
++    sessionCounter += 1;
++    // The production wiring: before_tool_call wrapper first, then the adapter, with one hook context.
++    const hookContext = {
++      agentId: "main",
++      sessionKey: `agent:main:failure-hint-${sessionCounter}`,
++      sessionId: `failure-hint-session-${sessionCounter}`,
++      runId: "run-failure-hint",
++      ...(config ? { config } : {}),
++    };
++    const wrapped = wrapToolWithBeforeToolCallHook(tool, hookContext as never);
++    const [definition] = toToolDefinitions([wrapped], hookContext as never);
++    if (!definition) {
++      throw new Error("missing tool definition");
++    }
++    return definition;
++  }
++
++  const unauthorized = (url?: string) =>
++    Object.assign(new Error(`Failed to fetch media from ${url}: HTTP 401 Unauthorized`), {
++      status: 401,
++    });
++
++  async function run(definition: ReturnType<typeof embeddedDefinition>, id: string, url: string) {
++    const result = await definition.execute(id, { url }, undefined, undefined, extensionContext);
++    const blocks = (result.content ?? []) as Array<{ type: string; text: string }>;
++    const details = result.details as { status?: string; error?: string } | undefined;
++    return {
++      details,
++      blocks,
++      hint: blocks.find((block) => block.text.startsWith("[システム通知")),
++    };
++  }
++
++  it("adds the hint from the 3rd consecutive failure of the same tool and kind, whatever the URL", async () => {
++    const definition = embeddedDefinition(createFlakyTool((_call, args) => unauthorized(args.url)));
++    const seen: boolean[] = [];
++    for (let i = 1; i <= 8; i += 1) {
++      const out = await run(definition, `call-${i}`, `https://example.invalid/v${i}/doc.pdf`);
++      expect(out.details?.status).toBe("error");
++      expect(out.details?.error).not.toContain("システム通知");
++      seen.push(out.hint !== undefined);
++    }
++    expect(seen).toEqual([false, false, true, true, true, true, true, true]);
++  });
++
++  it("never blocks: the hinted call is still an error result and the tool keeps running", async () => {
++    const tool = createFlakyTool((_call, args) => unauthorized(args.url));
++    const executeSpy = vi.spyOn(tool, "execute");
++    const definition = embeddedDefinition(tool);
++    for (let i = 1; i <= 12; i += 1) {
++      const out = await run(definition, `call-${i}`, `https://example.invalid/${i}.pdf`);
++      expect(out.details?.status).toBe("error");
++    }
++    expect(executeSpy).toHaveBeenCalledTimes(12);
++  });
++
++  it("restarts the count after a success of that tool", async () => {
++    const definition = embeddedDefinition(
++      createFlakyTool((call, args) => (call === 3 ? undefined : unauthorized(args.url))),
++    );
++    const hints: boolean[] = [];
++    for (let i = 1; i <= 7; i += 1) {
++      hints.push(
++        (await run(definition, `call-${i}`, `https://example.invalid/${i}`)).hint !== undefined,
++      );
++    }
++    // calls 1,2 fail; 3 succeeds (reset); 4,5 fail; 6 is the 3rd failure since; 7 too.
++    expect(hints).toEqual([false, false, false, false, false, true, true]);
++  });
++
++  it("follows tools.failureHint.afterConsecutiveFailures (N=2, and 0 = off)", async () => {
++    const at = (n: number) => ({ tools: { failureHint: { afterConsecutiveFailures: n } } });
++    const two = embeddedDefinition(
++      createFlakyTool((_c, args) => unauthorized(args.url)),
++      at(2),
++    );
++    const twoHints: boolean[] = [];
++    for (let i = 1; i <= 3; i += 1) {
++      twoHints.push((await run(two, `c-${i}`, `https://example.invalid/${i}`)).hint !== undefined);
++    }
++    expect(twoHints).toEqual([false, true, true]);
++
++    const off = embeddedDefinition(
++      createFlakyTool((_c, args) => unauthorized(args.url)),
++      at(0),
++    );
++    for (let i = 1; i <= 6; i += 1) {
++      expect((await run(off, `o-${i}`, `https://example.invalid/${i}`)).hint).toBeUndefined();
++    }
++  });
++
++  it("keeps no streak without a hook context (no session to count in)", async () => {
++    const tool = createFlakyTool((_c, args) => unauthorized(args.url));
++    const [definition] = toToolDefinitions([tool]);
++    for (let i = 1; i <= 5; i += 1) {
++      const result = await definition!.execute(
++        `n-${i}`,
++        { url: `https://example.invalid/${i}` },
++        undefined,
++        undefined,
++        extensionContext,
++      );
++      expect(result.content).toHaveLength(1);
++    }
++  });
++});
++
+ // ---------------------------------------------------------------------------
+ // toClientToolDefinitions – streaming tool-call argument coercion (#57009)
+ // ---------------------------------------------------------------------------
+diff --git a/src/agents/agent-tool-definition-adapter.session-loop.test.ts b/src/agents/agent-tool-definition-adapter.session-loop.test.ts
+new file mode 100644
+index 000000000..7192fe6c7
+--- /dev/null
++++ b/src/agents/agent-tool-definition-adapter.session-loop.test.ts
+@@ -0,0 +1,131 @@
++/**
++ * The tool failure hint through the real agent session loop: the before_tool_call wrapper and the
++ * adapter wire the tool exactly as the embedded runner does, and only the model stream is scripted.
++ * Asserts on what the model receives as tool results.
++ */
++import type { AssistantMessage, Context, Model } from "openclaw/plugin-sdk/llm";
++import { Type } from "typebox";
++import { beforeEach, describe, expect, it } from "vitest";
++import { resetDiagnosticSessionStateForTest } from "../logging/diagnostic-session-state.js";
++import { toToolDefinitions } from "./agent-tool-definition-adapter.js";
++import { wrapToolWithBeforeToolCallHook } from "./agent-tools.before-tool-call.js";
++import type { AgentTool } from "./runtime/index.js";
++import {
++  createAssistant,
++  createAssistantResultStream,
++  createTestSession,
++  registerAgentSessionLoopTestLifecycle,
++  streamMocks,
++} from "./sessions/agent-session-loop-correctness.test-support.js";
++
++registerAgentSessionLoopTestLifecycle();
++
++type ToolResultMessage = { role: string; content?: Array<{ type: string; text?: string }> };
++
++function toolResultTexts(context: Context): string[] {
++  return (context.messages as ToolResultMessage[])
++    .filter((message) => message.role === "toolResult")
++    .map((message) =>
++      (message.content ?? []).map((block) => block.text ?? "").join("\n---block---\n"),
++    );
++}
++
++async function runCircling(params: {
++  config?: Record<string, unknown>;
++  calls: number;
++  succeedOnCall?: number;
++}): Promise<string[]> {
++  let executed = 0;
++  const tool = {
++    name: "pdf",
++    label: "PDF",
++    description: "fails with HTTP 401 for any URL",
++    parameters: Type.Object({ url: Type.String() }),
++    execute: async (_id: string, args: { url: string }) => {
++      executed += 1;
++      if (executed === params.succeedOnCall) {
++        return { content: [{ type: "text" as const, text: "summary" }], details: { status: "ok" } };
++      }
++      throw Object.assign(new Error(`Failed to fetch media from ${args.url}: HTTP 401`), {
++        status: 401,
++      });
++    },
++  } as unknown as AgentTool;
++  const hookContext = {
++    agentId: "main",
++    sessionKey: "agent:main:session-loop-hint",
++    sessionId: "session-loop-hint",
++    runId: "run-session-loop-hint",
++    ...(params.config ? { config: params.config } : {}),
++  };
++  const customTools = toToolDefinitions(
++    [wrapToolWithBeforeToolCallHook(tool, hookContext as never)],
++    hookContext as never,
++  );
++  const contexts: Context[] = [];
++  streamMocks.streamSimple.mockImplementation((model: Model, context: Context) => {
++    contexts.push(context);
++    const call = contexts.length;
++    const content: AssistantMessage["content"] =
++      call <= params.calls
++        ? [
++            {
++              type: "toolCall",
++              id: `call-${call}`,
++              name: "pdf",
++              arguments: { url: `https://example.invalid/v${call}/doc.pdf` },
++            },
++          ]
++        : [{ type: "text", text: "done" }];
++    return createAssistantResultStream(
++      createAssistant(model, content, call <= params.calls ? "toolUse" : "stop"),
++    );
++  });
++  const { session } = await createTestSession({ customTools });
++  session.setActiveToolsByName(["pdf"]);
++  await session.prompt("please read the document");
++  return toolResultTexts(contexts[contexts.length - 1]!);
++}
++
++describe("tool failure hint in the session loop", () => {
++  beforeEach(() => {
++    resetDiagnosticSessionStateForTest();
++  });
++
++  it("the model receives the hint with the tool result from the 3rd consecutive failure on", async () => {
++    const results = await runCircling({ calls: 5 });
++    expect(results).toHaveLength(5);
++    expect(results.map((text) => text.includes("[システム通知"))).toEqual([
++      false,
++      false,
++      true,
++      true,
++      true,
++    ]);
++    // The error itself is unchanged and first; the hint is one more block after it.
++    expect(results[2]).toContain('"status": "error"');
++    expect(results[2]).toContain("HTTP 401");
++    expect(results[2]).toContain("別の方法に切り替えるか、利用者へ状況を伝えてください");
++    expect(results[0]).not.toContain("---block---");
++    expect(results[2]).toContain("---block---");
++  });
++
++  it("restarts after a success, and tools.failureHint.afterConsecutiveFailures = 0 turns it off", async () => {
++    resetDiagnosticSessionStateForTest();
++    const afterSuccess = await runCircling({ calls: 6, succeedOnCall: 3 });
++    expect(afterSuccess.map((text) => text.includes("[システム通知"))).toEqual([
++      false,
++      false,
++      false,
++      false,
++      false,
++      true,
++    ]);
++    resetDiagnosticSessionStateForTest();
++    const off = await runCircling({
++      calls: 5,
++      config: { tools: { failureHint: { afterConsecutiveFailures: 0 } } },
++    });
++    expect(off.some((text) => text.includes("[システム通知"))).toBe(false);
++  });
++});
+diff --git a/src/gateway/mcp-http.handlers.ts b/src/gateway/mcp-http.handlers.ts
+index a0f7a145f..b66c4a151 100644
+--- a/src/gateway/mcp-http.handlers.ts
++++ b/src/gateway/mcp-http.handlers.ts
+@@ -7,6 +7,10 @@ import { runBeforeToolCallHook, type HookContext } from "../agents/agent-tools.b
+ import { extractToolErrorMessage } from "../agents/embedded-agent-tool-results.js";
+ import { runAgentHarnessAfterToolCallHook } from "../agents/harness/hook-helpers.js";
+ import { copyInternalToolResultState } from "../agents/runtime/internal-hooks.js";
++import {
++  recordToolFailureForHint,
++  resetToolFailureStreak,
++} from "../agents/tool-loop-failure-hint.js";
+ import {
+   formatToolExecutionErrorMessage,
+   protectNetworkToolExecutionError,
+@@ -142,6 +146,7 @@ export async function handleMcpJsonRpc(params: {
+       const toolCallId = `mcp-${crypto.randomUUID()}`;
+       const startedAt = Date.now();
+       let executedToolArgs = toolArgs;
++      let failureHint: string | undefined;
+       const reportToolCallResult = (
+         outcome: McpLoopbackToolCallOutcome,
+         result: unknown,
+@@ -230,11 +235,18 @@ export async function handleMcpJsonRpc(params: {
+         try {
+           result = await tool.execute(toolCallId, finalizedToolArgs, params.signal);
+         } catch (error) {
++          if (!params.signal?.aborted) {
++            // Hint only: from the Nth failure of the same tool and kind the model is told to switch or tell the user.
++            failureHint = recordToolFailureForHint(params.hookContext, toolName, error);
++          }
+           throw tool.resultContentSource === "network"
+             ? protectNetworkToolExecutionError(error, "tool execution failed", params.signal)
+             : error;
+         }
+         const failureKind = resolveToolResultFailureKind(result);
++        if (failureKind === undefined) {
++          resetToolFailureStreak(params.hookContext, toolName);
++        }
+         reportToolCallResult(
+           failureKind === "blocked"
+             ? { outcome: "blocked", deniedReason: "tool_result_blocked" }
+@@ -262,7 +274,10 @@ export async function handleMcpJsonRpc(params: {
+           message,
+         );
+         return jsonRpcResult(id, {
+-          content: [{ type: "text", text: message || "tool execution failed" }],
++          content: [
++            { type: "text", text: message || "tool execution failed" },
++            ...(failureHint ? [{ type: "text", text: failureHint }] : []),
++          ],
+           isError: true,
+         });
+       }
+diff --git a/src/gateway/mcp-http.handlers.failure-hint.test.ts b/src/gateway/mcp-http.handlers.failure-hint.test.ts
+new file mode 100644
+index 000000000..1df443bb7
+--- /dev/null
++++ b/src/gateway/mcp-http.handlers.failure-hint.test.ts
+@@ -0,0 +1,109 @@
++// Covers the consecutive tool-failure hint on the CLI runtimes' MCP loopback path.
++import { beforeEach, describe, expect, it, vi } from "vitest";
++import type { AnyAgentTool } from "../agents/tools/common.js";
++import { resetDiagnosticSessionStateForTest } from "../logging/diagnostic-session-state.js";
++import { handleMcpJsonRpc } from "./mcp-http.handlers.js";
++
++type CallResult = { result: { content: Array<{ type: "text"; text: string }>; isError: boolean } };
++
++function createTool(failFor: (args: { url?: string }, call: number) => Error | undefined) {
++  let calls = 0;
++  return {
++    name: "pdf",
++    label: "PDF",
++    description: "pdf stand-in",
++    parameters: { type: "object", properties: {} } as never,
++    execute: vi.fn(async (_id: string, args: { url?: string }) => {
++      calls += 1;
++      const failure = failFor(args, calls);
++      if (failure) {
++        throw failure;
++      }
++      return { content: [{ type: "text" as const, text: "summary" }], details: { status: "ok" } };
++    }),
++  } as unknown as AnyAgentTool;
++}
++
++async function call(
++  tool: AnyAgentTool,
++  url: string,
++  hookContext?: Parameters<typeof handleMcpJsonRpc>[0]["hookContext"],
++) {
++  const response = await handleMcpJsonRpc({
++    message: {
++      jsonrpc: "2.0",
++      id: 1,
++      method: "tools/call",
++      params: { name: tool.name, arguments: { url } },
++    },
++    tools: [tool],
++    toolSchema: [
++      { name: tool.name, description: tool.description, inputSchema: { type: "object" } },
++    ],
++    ...(hookContext ? { hookContext } : {}),
++  });
++  const result = (response as CallResult).result;
++  return {
++    isError: result.isError,
++    first: result.content[0]?.text ?? "",
++    hint: result.content.find((block) => block.text.startsWith("[システム通知"))?.text,
++  };
++}
++
++const unauthorized = (url?: string) =>
++  Object.assign(new Error(`Failed to fetch media from ${url}: HTTP 401 Unauthorized`), {
++    status: 401,
++  });
++
++describe("MCP loopback tool failure hint", () => {
++  beforeEach(() => {
++    resetDiagnosticSessionStateForTest();
++  });
++
++  it("adds the hint from the 3rd consecutive failure, whatever the URL, and never blocks", async () => {
++    const tool = createTool((args) => unauthorized(args.url));
++    const hookContext = { sessionKey: "agent:main:mcp-hint-a", runId: "run-1" };
++    const hints: boolean[] = [];
++    for (let i = 1; i <= 6; i += 1) {
++      const out = await call(tool, `https://example.invalid/v${i}.pdf`, hookContext);
++      expect(out.isError).toBe(true);
++      expect(out.first).toContain("HTTP 401");
++      expect(out.first).not.toContain("システム通知");
++      hints.push(out.hint !== undefined);
++    }
++    expect(hints).toEqual([false, false, true, true, true, true]);
++    expect(tool.execute).toHaveBeenCalledTimes(6);
++  });
++
++  it("restarts after a success of the tool and follows tools.failureHint.afterConsecutiveFailures", async () => {
++    const tool = createTool((args, n) => (n === 2 ? undefined : unauthorized(args.url)));
++    const hookContext = {
++      sessionKey: "agent:main:mcp-hint-b",
++      runId: "run-1",
++      config: { tools: { failureHint: { afterConsecutiveFailures: 2 } } } as never,
++    };
++    const trace: string[] = [];
++    for (let i = 1; i <= 5; i += 1) {
++      const out = await call(tool, `https://example.invalid/${i}`, hookContext);
++      trace.push(`${out.isError ? "error" : "ok"}${out.hint ? "+hint" : ""}`);
++    }
++    // call 1 fails; 2 succeeds (reset); 3 fails; 4 is the 2nd failure since; 5 too.
++    expect(trace).toEqual(["error", "ok", "error", "error+hint", "error+hint"]);
++  });
++
++  it("gives no hint when disabled (0) or without a session", async () => {
++    const off = createTool((args) => unauthorized(args.url));
++    const offContext = {
++      sessionKey: "agent:main:mcp-hint-c",
++      runId: "run-1",
++      config: { tools: { failureHint: { afterConsecutiveFailures: 0 } } } as never,
++    };
++    for (let i = 1; i <= 5; i += 1) {
++      expect((await call(off, `https://example.invalid/${i}`, offContext)).hint).toBeUndefined();
++    }
++    const anonymous = createTool((args) => unauthorized(args.url));
++    for (let i = 1; i <= 5; i += 1) {
++      expect((await call(anonymous, `https://example.invalid/${i}`)).hint).toBeUndefined();
++    }
++  });
++});

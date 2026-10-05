@@ -5,6 +5,8 @@ ixg の発注（inspire-brain Issue #3・材料 `sparx-cloud-inputs/ixg/20261005
 各 `it` は**望ましい動作**を主張する。満たさない版では FAIL ＝「不通」（隠さない）。設定で直る物は「設定なし（FAIL しうる）」と「設定あり（PASS）」を対にしてある。
 本番に繋がない・鍵や token を使わない・LINE WORKS の plugin と客の会話は使わない（channel は試験用の id）。
 
+> **Issue #4（続き）**: F2・F5 の直しの patch（`patches/f2-*`・`f5a-*`・`f5b-*`）と、LINE WORKS の plugin から使う進捗表示の参照実装（`reference/`）を足した。中身・当て方・前後の結果・副作用は **[PATCHES.md](PATCHES.md)**、試験ごとの前後は `results/ISSUE4_BEFORE_AFTER.md`。F2・F5 の試験は patch の期待に合わせて書き直した（F2 12 件・F5 27 件）。試験は F7（進捗表示）を足して 232 件。以下の「結果」「型ごと」は #3 の時点（patch なし）の記録。
+
 ## 回し方
 
 ```bash
@@ -29,7 +31,9 @@ node ixg-taikan-acceptance/table.mjs out/A_all.json out/B_all.json   # 型ごと
 | `tests/f4-*.test.ts` `f4-*.support.ts`             | F4 枠切れ（本物の reply 層 `runReplyAgent` と `runWithModelFallback`・CLI のエラーは stream-json の `is_error` から）       |
 | `tests/f5-tool-failure.test.ts` `.support.ts`      | F5 道具の失敗（本物の pdf tool を loopback の 401 サーバーと temp dir で。model には届かせない）                            |
 | `tests/f6-second-message-while-processing.test.ts` | F6 処理中の 2 通目（TypingController・queue・dispatcher）                                                                   |
-| `patches/`                                         | 直しの patch（検証済み。下記）                                                                                              |
+| `patches/`                                         | 直しの patch（#3: F4・F6 ／ #4: F2・F5a・F5b。検証済み。#4 は PATCHES.md）                                                  |
+| `reference/` `tests/f7-*`                          | #4: 自作の LINE WORKS plugin から使う進捗表示の参照実装（読み取り板・手引き・plugin への差分例）と、その試験                |
+| `PATCHES.md`                                       | #4: patch の当て方・file:line・副作用・前後の結果                                                                           |
 | `results/`                                         | A／B の結果（`A.json` `B.json`・`TABLE.md` ＝ 試験ごとの表）                                                                |
 | `run.sh` `summarize.mjs` `table.mjs`               | 回す・表にする道具                                                                                                          |
 

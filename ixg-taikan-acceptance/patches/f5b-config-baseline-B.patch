@@ -1,0 +1,22 @@
+diff --git a/docs/.generated/config-baseline.counts.json b/docs/.generated/config-baseline.counts.json
+index 0479ab685..86d174a5f 100644
+--- a/docs/.generated/config-baseline.counts.json
++++ b/docs/.generated/config-baseline.counts.json
+@@ -1,5 +1,5 @@
+ {
+-  "core": 2475,
++  "core": 2477,
+   "channel": 3786,
+   "plugin": 4431
+ }
+diff --git a/docs/.generated/config-baseline.sha256 b/docs/.generated/config-baseline.sha256
+index 214880646..11fde979a 100644
+--- a/docs/.generated/config-baseline.sha256
++++ b/docs/.generated/config-baseline.sha256
+@@ -1,4 +1,4 @@
+-ca30938c0fd7f24c3ba4bf4b337608edcbfed6c1880315ed85bad85463a004db  config-baseline.json
+-75f58a4dca3537b254a66913b7464d8f460e82db5f54c6a22af7fd7468dd8aa0  config-baseline.core.json
++e15b85541e671be482c237b2864848c6c7db33ff0b41262f6a4db1ab7977e900  config-baseline.json
++13d0dca2cecaf81004a4c2fd97cb11b9ed8a40031c4913d7545315c70a94065c  config-baseline.core.json
+ 16d1fbf526df89956af76f8f3bd6aebb254a196b3e2400b6ec865b8dea3899fe  config-baseline.channel.json
+ 17a8af4180b973c9202a0e0fc9ee5918b15c9a5759c4ab869012384005e7bb70  config-baseline.plugin.json

@@ -119,13 +119,19 @@ export function guidanceTextOf(message: string, echoed: string[] = []): string {
     .replace(/\bUnauthorized\b/gi, "");
 }
 
-/** Words that tell the model/user HOW to open an auth-walled URL (credentials, headers, authenticated fetch). */
+/**
+ * What tells the model HOW to open an auth-walled URL: authenticated fetch into the workspace, or asking the customer
+ * (attach the file / open the sharing permission). Japanese (the F5a wording) or the English credential words.
+ */
 export const AUTH_GUIDANCE =
-  /\b(authenticat\w*|credential\w*|authori[sz]ation|bearer|api[- ]?key|token|headers?|sign[- ]?in|log[- ]?in|cookie\w*)\b/i;
+  /認証|ログイン|共有設定|権限|\b(authenticat\w*|credential\w*|authori[sz]ation|bearer|api[- ]?key|token|headers?|sign[- ]?in|log[- ]?in|cookie\w*)\b/i;
 
-/** Words that name the controlling setting or a concrete remedy for "path outside allowed locations". */
+/** What names the controlling setting or a concrete remedy for "path outside allowed locations". */
 export const PATH_REMEDY =
-  /\b(tools\.fs|workspaceOnly|allowed[- ]roots?|local[- ]roots?|readOnlyRoots|config(?:uration)?|setting|openclaw\.json|copy|move)\b|workspace/i;
+  /作業場|コピー|移す|添付|\b(tools\.fs|workspaceOnly|allowed[- ]roots?|local[- ]roots?|readOnlyRoots|config(?:uration)?|setting|openclaw\.json|copy|move)\b|workspace/i;
+
+/** Hiragana / katakana / kanji: the text is written in Japanese. */
+export const JAPANESE = /[\u3040-\u30ff\u3400-\u9fff]/;
 
 // run.sh exports IXG_TAIKAN_RECORD_DIR (= <branch>/ixg-taikan-acceptance/out); without it nothing is written to a file.
 const RECORD_DIR = process.env.IXG_TAIKAN_RECORD_DIR ?? "";
@@ -145,7 +151,8 @@ export function resetRecords(): void {
 }
 
 export function record(label: string, value: unknown): void {
-  const line = `[F5-RECORD] ${label}: ${typeof value === "string" ? value : JSON.stringify(value)}`;
+  // One line per record: multi-line texts are written as JSON strings.
+  const line = `[F5-RECORD] ${label}: ${typeof value === "string" && !value.includes("\n") ? value : JSON.stringify(value)}`;
   console.log(line);
   const file = recordFile();
   if (file) {

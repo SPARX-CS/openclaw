@@ -1,0 +1,507 @@
+diff --git a/src/agents/tool-loop-failure-hint.ts b/src/agents/tool-loop-failure-hint.ts
+new file mode 100644
+index 000000000..6f4e47976
+--- /dev/null
++++ b/src/agents/tool-loop-failure-hint.ts
+@@ -0,0 +1,200 @@
++/**
++ * Consecutive tool-failure hint.
++ *
++ * Counts failures per (tool, failure kind) for the current run of a session, whatever the
++ * arguments were, so a bot that varies the URL or path on every retry still counts. From the
++ * Nth failure on it gives the model a Japanese note: this way does not work, switch or tell the
++ * user. It is a hint only; nothing is blocked or stopped (tools.loopDetection owns blocking).
++ * A success of the tool clears its streaks. tools.failureHint.afterConsecutiveFailures sets N.
++ */
++import type { OpenClawConfig } from "../config/types.openclaw.js";
++import {
++  getDiagnosticSessionState,
++  peekDiagnosticSessionState,
++  type SessionState,
++} from "../logging/diagnostic-session-state.js";
++import {
++  readToolResultStatus,
++  isToolResultError,
++  resolveToolExecutionErrorKind,
++} from "./tool-result-error.js";
++
++export const DEFAULT_TOOL_FAILURE_HINT_AFTER = 3;
++
++/** The slice of the before_tool_call HookContext this module needs. */
++export type ToolFailureHintContext = {
++  config?: OpenClawConfig;
++  sessionKey?: string;
++  sessionId?: string;
++  runId?: string;
++};
++
++/** Resolves N from tools.failureHint.afterConsecutiveFailures (default 3; 0 disables). */
++export function resolveToolFailureHintThreshold(config?: OpenClawConfig): number {
++  const value = config?.tools?.failureHint?.afterConsecutiveFailures;
++  return typeof value === "number" && Number.isInteger(value) && value >= 0
++    ? value
++    : DEFAULT_TOOL_FAILURE_HINT_AFTER;
++}
++
++function readField(value: unknown, key: string): unknown {
++  try {
++    return value !== null && typeof value === "object" ? Reflect.get(value, key) : undefined;
++  } catch {
++    return undefined;
++  }
++}
++
++function readErrorMessage(error: unknown): string {
++  const message = error instanceof Error ? readField(error, "message") : error;
++  return typeof message === "string" ? message : "";
++}
++
++function readHttpStatus(error: unknown): number | undefined {
++  let current: unknown = error;
++  for (let depth = 0; depth < 3 && current; depth += 1) {
++    const status = readField(current, "status");
++    if (typeof status === "number" && Number.isInteger(status) && status >= 400 && status <= 599) {
++      return status;
++    }
++    current = readField(current, "cause");
++  }
++  // "HTTP 401 ..." (media fetch) or "Web fetch failed (404): ..." (web_fetch).
++  const match = /\b(?:HTTP[ /:]*|failed \()(\d{3})\b/.exec(readErrorMessage(error));
++  const parsed = match ? Number(match[1]) : undefined;
++  return parsed !== undefined && parsed >= 400 && parsed <= 599 ? parsed : undefined;
++}
++
++/**
++ * Short, argument-free classification of a tool failure: http_401 / http_403 / http_404 /
++ * http_429 / http_4xx / http_5xx, path_not_allowed, not_found, not_pdf, timeout, other.
++ */
++export function classifyToolFailureKind(error: unknown): string {
++  if (resolveToolExecutionErrorKind(error) === "timed_out") {
++    return "timeout";
++  }
++  const status = readHttpStatus(error);
++  if (status !== undefined) {
++    return [401, 403, 404, 429].includes(status)
++      ? `http_${status}`
++      : status >= 500
++        ? "http_5xx"
++        : "http_4xx";
++  }
++  const code = readField(error, "code");
++  const message = readErrorMessage(error);
++  if (code === "path-not-allowed" || /not under an allowed directory/i.test(message)) {
++    return "path_not_allowed";
++  }
++  if (code === "not-found" || code === "ENOENT") {
++    return "not_found";
++  }
++  if (/Expected PDF but got/i.test(message)) {
++    return "not_pdf";
++  }
++  return "other";
++}
++
++const KIND_LABELS: Record<string, string> = {
++  http_401: "認証が必要・HTTP 401",
++  http_403: "アクセス権がない・HTTP 403",
++  http_404: "見つからない・HTTP 404",
++  http_429: "相手側の利用制限・HTTP 429",
++  http_4xx: "相手に拒否された・HTTP 4xx",
++  http_5xx: "相手のサーバーの不具合・HTTP 5xx",
++  path_not_allowed: "許可されていない場所のファイル",
++  not_found: "ファイルが見つからない",
++  not_pdf: "PDF ではない内容",
++  timeout: "時間切れ",
++};
++
++/** The Japanese note the model sees from the Nth consecutive failure on. */
++export function buildToolFailureHint(params: {
++  toolName: string;
++  kind: string;
++  count: number;
++}): string {
++  const label = KIND_LABELS[params.kind];
++  const what = label ? `同じ種類の失敗（${label}）` : "失敗";
++  return [
++    `[システム通知: ${params.toolName} ツールで${what}が ${params.count} 回続いています。この方法では取れていません。URL やパスなど引数だけを変えて同じ道具を試し続けても、結果は変わりません。別の方法に切り替えるか、利用者へ状況を伝えてください。`,
++    "利用者はこちらの内部の状況を知りません。伝えるときは、結論を先に、次の点を分かる言葉で書いてください: 何が足りないか／何が問題か／足りない情報があれば利用者に何を頼みたいか（例: ファイルの添付・共有設定の変更・正しい情報の連絡）／できない場合はその理由。「もう一度送ってください」だけの返事にはしないでください。]",
++  ].join("\n");
++}
++
++function readStreaks(state: SessionState, runId: string | undefined) {
++  const current = state.toolFailureStreaks;
++  if (current && current.runId === runId) {
++    return current;
++  }
++  // A new run (a new user message) starts a fresh count: the user has had their say since.
++  const fresh = { runId, byTool: new Map<string, Map<string, number>>() };
++  state.toolFailureStreaks = fresh;
++  return fresh;
++}
++
++/**
++ * Counts one failed call of `toolName`. Returns the hint to append once the streak of the same
++ * (tool, kind) has reached the threshold, otherwise undefined. Never throws.
++ */
++export function recordToolFailureForHint(
++  ctx: ToolFailureHintContext | undefined,
++  toolName: string,
++  error: unknown,
++): string | undefined {
++  try {
++    const threshold = resolveToolFailureHintThreshold(ctx?.config);
++    if (threshold <= 0 || (!ctx?.sessionKey && !ctx?.sessionId)) {
++      return undefined;
++    }
++    // A before_tool_call veto or approval denial is a decision, not a failing tool.
++    if (readField(error, "disposition") === "blocked") {
++      return undefined;
++    }
++    const state = getDiagnosticSessionState({
++      sessionKey: ctx.sessionKey,
++      sessionId: ctx.sessionId,
++    });
++    const { byTool } = readStreaks(state, ctx.runId);
++    const kind = classifyToolFailureKind(error);
++    const byKind = byTool.get(toolName) ?? new Map<string, number>();
++    byTool.set(toolName, byKind);
++    const count = (byKind.get(kind) ?? 0) + 1;
++    byKind.set(kind, count);
++    return count >= threshold ? buildToolFailureHint({ toolName, kind, count }) : undefined;
++  } catch {
++    return undefined;
++  }
++}
++
++/** A success of `toolName` clears all of its failure streaks. Never throws. */
++export function resetToolFailureStreak(
++  ctx: ToolFailureHintContext | undefined,
++  toolName: string,
++): void {
++  try {
++    if (!ctx?.sessionKey && !ctx?.sessionId) {
++      return;
++    }
++    const state = peekDiagnosticSessionState({
++      sessionKey: ctx.sessionKey,
++      sessionId: ctx.sessionId,
++    });
++    state?.toolFailureStreaks?.byTool.delete(toolName);
++  } catch {
++    // The hint is advisory; never let bookkeeping change a tool result.
++  }
++}
++
++/** True for a returned result that is a real success (not an error, a veto or a skipped call). */
++export function isToolSuccessForFailureHint(result: unknown): boolean {
++  return !isToolResultError(result) && readToolResultStatus(result) !== "skipped";
++}
++
++/** Appends the hint to what the model sees, as one more text block (like the loop warning). */
++export function appendToolFailureHint<T extends { content?: unknown[] }>(
++  result: T,
++  hint: string,
++): T {
++  return { ...result, content: [...(result.content ?? []), { type: "text", text: hint }] };
++}
+diff --git a/src/agents/tool-loop-failure-hint.test.ts b/src/agents/tool-loop-failure-hint.test.ts
+new file mode 100644
+index 000000000..abffbba74
+--- /dev/null
++++ b/src/agents/tool-loop-failure-hint.test.ts
+@@ -0,0 +1,216 @@
++// Covers the consecutive tool-failure hint: failure kinds, per-(tool, kind) streaks, reset, config.
++import { beforeEach, describe, expect, it } from "vitest";
++import { validateConfigObject } from "../config/validation.js";
++import { resetDiagnosticSessionStateForTest } from "../logging/diagnostic-session-state.js";
++import {
++  appendToolFailureHint,
++  buildToolFailureHint,
++  classifyToolFailureKind,
++  isToolSuccessForFailureHint,
++  recordToolFailureForHint,
++  resetToolFailureStreak,
++  resolveToolFailureHintThreshold,
++} from "./tool-loop-failure-hint.js";
++
++function httpError(status: number, message = `Failed to fetch media from <url>: HTTP ${status}`) {
++  return Object.assign(new Error(message), { status });
++}
++
++const ctx = (extra: Record<string, unknown> = {}) => ({
++  sessionKey: "agent:main:hint-test",
++  runId: "run-1",
++  ...extra,
++});
++
++describe("classifyToolFailureKind", () => {
++  it.each([
++    [httpError(401), "http_401"],
++    [httpError(403), "http_403"],
++    [httpError(404), "http_404"],
++    [httpError(429), "http_429"],
++    [httpError(410), "http_4xx"],
++    [httpError(503), "http_5xx"],
++    [new Error("Failed to fetch media from x: HTTP 401 Unauthorized; body: nope"), "http_401"],
++    [new Error("Web fetch failed (404): not here"), "http_404"],
++    [new Error("Web fetch failed (502): bad gateway"), "http_5xx"],
++    [
++      new Error("Local media path is not under an allowed directory: /somewhere"),
++      "path_not_allowed",
++    ],
++    [Object.assign(new Error("denied"), { code: "path-not-allowed" }), "path_not_allowed"],
++    [Object.assign(new Error("missing"), { code: "ENOENT" }), "not_found"],
++    [new Error("Expected PDF but got text/html: https://example.invalid/x"), "not_pdf"],
++    [Object.assign(new Error("slow"), { name: "TimeoutError" }), "timeout"],
++    [Object.assign(new Error("slow"), { code: "ETIMEDOUT" }), "timeout"],
++    [new Error("something else"), "other"],
++    ["not an error object", "other"],
++  ])("classifies %#", (error, kind) => {
++    expect(classifyToolFailureKind(error)).toBe(kind);
++  });
++
++  it("finds a status on the cause and ignores non-error status values", () => {
++    expect(classifyToolFailureKind(new Error("wrapped", { cause: httpError(404) }))).toBe(
++      "http_404",
++    );
++    expect(classifyToolFailureKind(Object.assign(new Error("x"), { status: "error" }))).toBe(
++      "other",
++    );
++  });
++
++  it("does not put arguments into the kind (URL and path never reach it)", () => {
++    const a = classifyToolFailureKind(
++      new Error("Failed to fetch media from http://a/1.pdf: HTTP 401"),
++    );
++    const b = classifyToolFailureKind(
++      new Error("Failed to fetch media from http://b/2.pdf: HTTP 401"),
++    );
++    expect(a).toBe(b);
++  });
++});
++
++describe("resolveToolFailureHintThreshold", () => {
++  it("defaults to 3 and accepts 0 (off) and larger values; junk falls back to 3", () => {
++    const cfg = (value: unknown) => ({
++      tools: { failureHint: { afterConsecutiveFailures: value } },
++    });
++    expect(resolveToolFailureHintThreshold(undefined)).toBe(3);
++    expect(resolveToolFailureHintThreshold({} as never)).toBe(3);
++    expect(resolveToolFailureHintThreshold(cfg(0) as never)).toBe(0);
++    expect(resolveToolFailureHintThreshold(cfg(5) as never)).toBe(5);
++    expect(resolveToolFailureHintThreshold(cfg(-1) as never)).toBe(3);
++    expect(resolveToolFailureHintThreshold(cfg(1.5) as never)).toBe(3);
++    expect(resolveToolFailureHintThreshold(cfg("2") as never)).toBe(3);
++  });
++});
++
++describe("recordToolFailureForHint", () => {
++  beforeEach(() => {
++    resetDiagnosticSessionStateForTest();
++  });
++
++  it("gives no hint for the first two failures and a hint from the third on (default N=3)", () => {
++    const hints = [1, 2, 3, 4, 5].map((i) =>
++      recordToolFailureForHint(ctx(), "pdf", httpError(401, `HTTP 401 for variant ${i}`)),
++    );
++    expect(hints.map((hint) => hint !== undefined)).toEqual([false, false, true, true, true]);
++    expect(hints[2]).toContain("pdf");
++    expect(hints[2]).toContain("3 回");
++    expect(hints[4]).toContain("5 回");
++  });
++
++  it("counts per (tool, kind): another kind or another tool does not share the streak", () => {
++    const denied = new Error("Local media path is not under an allowed directory: /x");
++    expect(recordToolFailureForHint(ctx(), "pdf", httpError(401))).toBeUndefined();
++    expect(recordToolFailureForHint(ctx(), "pdf", denied)).toBeUndefined();
++    expect(recordToolFailureForHint(ctx(), "image", httpError(401))).toBeUndefined();
++    expect(recordToolFailureForHint(ctx(), "pdf", httpError(401))).toBeUndefined();
++    expect(recordToolFailureForHint(ctx(), "pdf", denied)).toBeUndefined();
++    expect(recordToolFailureForHint(ctx(), "pdf", httpError(401))).toContain("認証が必要");
++  });
++
++  it("clears the streaks of a tool on success, not those of other tools", () => {
++    recordToolFailureForHint(ctx(), "pdf", httpError(401));
++    recordToolFailureForHint(ctx(), "pdf", httpError(401));
++    recordToolFailureForHint(ctx(), "image", httpError(401));
++    recordToolFailureForHint(ctx(), "image", httpError(401));
++    resetToolFailureStreak(ctx(), "pdf");
++    expect(recordToolFailureForHint(ctx(), "pdf", httpError(401))).toBeUndefined();
++    expect(recordToolFailureForHint(ctx(), "image", httpError(401))).toBeDefined();
++  });
++
++  it("starts a fresh count in a new run of the same session", () => {
++    recordToolFailureForHint(ctx(), "pdf", httpError(401));
++    recordToolFailureForHint(ctx(), "pdf", httpError(401));
++    expect(
++      recordToolFailureForHint(ctx({ runId: "run-2" }), "pdf", httpError(401)),
++    ).toBeUndefined();
++  });
++
++  it("follows tools.failureHint.afterConsecutiveFailures, and 0 turns the hint off", () => {
++    const at = (n: number) =>
++      ctx({ config: { tools: { failureHint: { afterConsecutiveFailures: n } } } });
++    expect(recordToolFailureForHint(at(1), "a", httpError(500))).toBeDefined();
++    expect(recordToolFailureForHint(at(2), "b", httpError(500))).toBeUndefined();
++    expect(recordToolFailureForHint(at(2), "b", httpError(500))).toBeDefined();
++    for (let i = 0; i < 6; i += 1) {
++      expect(recordToolFailureForHint(at(0), "c", httpError(500))).toBeUndefined();
++    }
++  });
++
++  it("does not count a before_tool_call veto or approval denial (a decision, not a failing tool)", () => {
++    const denied = Object.assign(new Error("denied by policy"), { disposition: "blocked" });
++    for (let i = 0; i < 5; i += 1) {
++      expect(recordToolFailureForHint(ctx(), "pdf", denied)).toBeUndefined();
++    }
++    expect(recordToolFailureForHint(ctx(), "pdf", httpError(401))).toBeUndefined();
++  });
++
++  it("needs a session to keep a streak", () => {
++    for (let i = 0; i < 5; i += 1) {
++      expect(recordToolFailureForHint({}, "pdf", httpError(401))).toBeUndefined();
++      expect(recordToolFailureForHint(undefined, "pdf", httpError(401))).toBeUndefined();
++    }
++  });
++});
++
++describe("hint text and result helpers", () => {
++  it("is Japanese, tells the model to switch or tell the user, and carries no URL, path or secret", () => {
++    const hint = buildToolFailureHint({ toolName: "pdf", kind: "http_401", count: 3 });
++    expect(hint).toContain("この方法では取れていません");
++    expect(hint).toContain("別の方法に切り替えるか、利用者へ状況を伝えてください");
++    expect(hint).toContain("利用者はこちらの内部の状況を知りません");
++    expect(hint).toContain("何が足りないか");
++    expect(hint).toContain("できない場合はその理由");
++    expect(hint).not.toMatch(/https?:\/\//);
++    expect(buildToolFailureHint({ toolName: "x", kind: "other", count: 4 })).toContain(
++      "x ツールで失敗が 4 回続いています",
++    );
++  });
++
++  it("appends the hint as one more text block and keeps the original blocks", () => {
++    const result = { content: [{ type: "text", text: "first" }], details: { status: "error" } };
++    expect(appendToolFailureHint(result, "note")).toEqual({
++      content: [
++        { type: "text", text: "first" },
++        { type: "text", text: "note" },
++      ],
++      details: { status: "error" },
++    });
++  });
++
++  it("treats only real successes as a success (not errors, vetoes or skipped calls)", () => {
++    expect(isToolSuccessForFailureHint({ content: [], details: { status: "ok" } })).toBe(true);
++    expect(isToolSuccessForFailureHint({ content: [] })).toBe(true);
++    expect(isToolSuccessForFailureHint({ content: [], details: { status: "error" } })).toBe(false);
++    expect(isToolSuccessForFailureHint({ content: [], details: { status: "blocked" } })).toBe(
++      false,
++    );
++    expect(isToolSuccessForFailureHint({ content: [], details: { status: "skipped" } })).toBe(
++      false,
++    );
++  });
++});
++
++describe("tools.failureHint config", () => {
++  const validate = (failureHint: unknown) => validateConfigObject({ tools: { failureHint } });
++
++  it("accepts a non-negative integer, including 0", () => {
++    for (const value of [0, 1, 3, 10]) {
++      expect(validate({ afterConsecutiveFailures: value }).ok, String(value)).toBe(true);
++    }
++    expect(validate({}).ok).toBe(true);
++  });
++
++  it("rejects junk values and unknown keys (strict)", () => {
++    for (const bad of [
++      { afterConsecutiveFailures: -1 },
++      { afterConsecutiveFailures: 1.5 },
++      { afterConsecutiveFailures: "3" },
++      { afterConsecutiveFailures: null },
++      { afterConsecutiveFailures: 3, other: true },
++      { enabled: true },
++    ]) {
++      expect(validate(bad).ok, JSON.stringify(bad)).toBe(false);
++    }
++  });
++});
+diff --git a/src/config/zod-schema.agent-runtime.ts b/src/config/zod-schema.agent-runtime.ts
+index 47202897c..dff826c94 100644
+--- a/src/config/zod-schema.agent-runtime.ts
++++ b/src/config/zod-schema.agent-runtime.ts
+@@ -480,6 +480,14 @@ const ToolLoopDetectionSchema = z
+   .strict()
+   .optional();
+ 
++const ToolFailureHintSchema = z
++  .object({
++    /** Add a "switch approach / tell the user" hint to a tool failure once the same tool fails with the same kind this many times in a row (default: 3, 0 disables). */
++    afterConsecutiveFailures: z.number().int().min(0).optional(),
++  })
++  .strict()
++  .optional();
++
+ const ToolSearchSchema = z
+   .union([
+     z.boolean(),
+@@ -759,6 +767,8 @@ export const ToolsSchema = z
+       .strict()
+       .optional(),
+     loopDetection: ToolLoopDetectionSchema,
++    /** Hint (never a block) after repeated failures of the same tool and failure kind. */
++    failureHint: ToolFailureHintSchema,
+     /** Compact large OpenClaw, MCP, and client tool catalogs behind search/call tools. */
+     toolSearch: ToolSearchSchema,
+     /** Global Code Mode defaults and limits; agent/model settings can override activation. */
+diff --git a/src/config/types.tools.ts b/src/config/types.tools.ts
+index 23c8be5aa..f57c027b5 100644
+--- a/src/config/types.tools.ts
++++ b/src/config/types.tools.ts
+@@ -59,6 +59,8 @@ export type ToolProfileId = NonNullable<SchemaToolsConfig["profile"]>;
+ 
+ export type ToolLoopDetectionConfig = NonNullable<SchemaToolsConfig["loopDetection"]>;
+ 
++export type ToolFailureHintConfig = NonNullable<SchemaToolsConfig["failureHint"]>;
++
+ export type ToolSearchConfig = NonNullable<SchemaToolsConfig["toolSearch"]>;
+ 
+ export type CodeModeConfig = NonNullable<SchemaToolsConfig["codeMode"]>;
+diff --git a/src/config/schema.help.runtime.ts b/src/config/schema.help.runtime.ts
+index edd0b313e..44e6bdf0e 100644
+--- a/src/config/schema.help.runtime.ts
++++ b/src/config/schema.help.runtime.ts
+@@ -432,6 +432,8 @@ export const RUNTIME_FIELD_HELP: Record<string, string> = {
+     'Optional allowlist of model ids (e.g. "gpt-5.4" or "openai/gpt-5.4").',
+   "tools.loopDetection.enabled":
+     "Controls rolling-history tool-loop detection and the post-compaction guard. Omit to keep rolling detection off and post-compaction protection on. Set true to enable both, or false to disable both.",
++  "tools.failureHint.afterConsecutiveFailures":
++    "After this many failures of the same tool with the same failure kind in a row (whatever the arguments), a note telling the model to switch approach or tell the user is added to the tool result (default: 3). Never blocks or stops a tool. Set 0 to turn the note off.",
+   "tools.exec.notifyOnExit":
+     "When true (default), backgrounded exec sessions on exit and node exec lifecycle events enqueue a system event and request a heartbeat.",
+   "tools.exec.notifyOnExitEmptySuccess":
+diff --git a/src/config/schema.labels.ts b/src/config/schema.labels.ts
+index a5c616f87..9f4326451 100644
+--- a/src/config/schema.labels.ts
++++ b/src/config/schema.labels.ts
+@@ -179,6 +179,7 @@ export const FIELD_LABELS: Record<string, string> = {
+   "tools.exec.applyPatch.workspaceOnly": "apply_patch Workspace-Only",
+   "tools.exec.applyPatch.allowModels": "apply_patch Model Allowlist",
+   "tools.loopDetection.enabled": "Tool-loop Detection",
++  "tools.failureHint.afterConsecutiveFailures": "Tool Failure Hint Threshold",
+   "tools.fs.workspaceOnly": "Workspace-only FS tools",
+   "tools.sessions.visibility": "Session Tools Visibility",
+   "tools.exec.notifyOnExit": "Exec Notify On Exit",
+diff --git a/src/logging/diagnostic-session-state.ts b/src/logging/diagnostic-session-state.ts
+index 3c8ffdaff..f7ce6fb73 100644
+--- a/src/logging/diagnostic-session-state.ts
++++ b/src/logging/diagnostic-session-state.ts
+@@ -15,6 +15,8 @@ export type SessionState = {
+   activeQueuedTurn?: boolean;
+   toolCallHistory?: ToolCallRecord[];
+   toolLoopWarningBuckets?: Map<string, number>;
++  /** Failures per tool and failure kind in the current run, for the tool failure hint. */
++  toolFailureStreaks?: { runId?: string; byTool: Map<string, Map<string, number>> };
+   commandPollCounts?: Map<string, { count: number; lastPollAt: number }>;
+ };
+ 
