@@ -78,4 +78,5 @@ git apply $P/f5a-media-failure-core.patch $P/f5a-media-failure-wiring-X.patch
 
 - 本物の gateway・LINE WORKS の plugin・Claude CLI・本番は走らせていない（本物の core を seam で動かし、外側を偽にした）。
 - patch の既存試験（repo 側）: F2 の担当は `src/agents/subagents/**`（A 127 ファイル 2632 件・B 130 ファイル 2420 件が通る）、F5 の担当は触った module・config schema・mcp-http（A 2022 件・B 1892 件が通る）。B の `mcp-http.session-controls` は 1 度だけ flaky で落ち、再実行で通った。A の assertion-safety チェックは、触っていない `ui/`・`extensions/` の 527 ファイルで元から落ちる。
+- patch を全部当てた木での既存の repo の試験（`src/agents/subagents`・`src/media`・`agent-tool-definition-adapter`・`tool-loop*`・`media-tool*`/`pdf-tool*`/`image-tool*`・`src/gateway/mcp-http`・`src/config` の schema）: **B は 248 ファイル全部通過（4284 件・skip 12）**。A は 252 ファイル通過・1 件（`acp-spawn.authority.test.ts`）が全体の実行中の負荷で落ち、単独で 2 回再実行して通った（不安定な試験。patch とは無関係に見えるが、原因までは追っていない）。
 - 通知文面（F2 の知らせ・F5 の一言・進捗の文）はオーナーの確認前の案。
