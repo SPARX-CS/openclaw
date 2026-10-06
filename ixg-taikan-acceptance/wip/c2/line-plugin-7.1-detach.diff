@@ -1,0 +1,29 @@
+--- orig/monitor-0eXlx_Pe.js	2026-10-03 17:45:14
++++ new/monitor-0eXlx_Pe.js	2026-10-03 17:59:29
+@@ -14,7 +14,7 @@
+ import { buildMentionRegexes, formatInboundEnvelope, formatInboundMediaUnavailableText, formatLocationText, hasFinalInboundReplyDispatch, matchesMentionPatterns, resolveInboundSessionEnvelopeContext, toLocationContext } from "openclaw/plugin-sdk/channel-inbound";
+ import { chunkMarkdownText } from "openclaw/plugin-sdk/reply-runtime";
+ import { isRequestBodyLimitError, normalizePluginHttpPath, normalizeWebhookPath, registerWebhookTargetWithPluginRoute, requestBodyErrorToText, resolveSingleWebhookTarget } from "openclaw/plugin-sdk/webhook-ingress";
+-import { beginWebhookRequestPipelineOrReject, createWebhookInFlightLimiter, isRequestBodyLimitError as isRequestBodyLimitError$1, readRequestBodyWithLimit, requestBodyErrorToText as requestBodyErrorToText$1 } from "openclaw/plugin-sdk/webhook-request-guards";
++import { beginWebhookRequestPipelineOrReject, runDetachedWebhookWork, createWebhookInFlightLimiter, isRequestBodyLimitError as isRequestBodyLimitError$1, readRequestBodyWithLimit, requestBodyErrorToText as requestBodyErrorToText$1 } from "openclaw/plugin-sdk/webhook-request-guards";
+ import { DEFAULT_GROUP_HISTORY_LIMIT, createChannelHistoryWindow } from "openclaw/plugin-sdk/reply-history";
+ import { getRuntimeConfig } from "openclaw/plugin-sdk/runtime-config-snapshot";
+ import { resolveStableChannelMessageIngress } from "openclaw/plugin-sdk/channel-ingress-runtime";
+@@ -1186,7 +1186,7 @@
+ 			if (receiveContext.shouldAckAfter("receive_record")) await receiveContext.ack();
+ 			if (body.events && body.events.length > 0) {
+ 				logVerbose(`line: received ${body.events.length} webhook events`);
+-				Promise.resolve().then(() => params.bot.handleWebhook(body)).catch((err) => logLineWebhookDispatchError(params.runtime, err));
++				runDetachedWebhookWork(() => params.bot.handleWebhook(body)).catch((err) => logLineWebhookDispatchError(params.runtime, err));
+ 			}
+ 		} catch (err) {
+ 			await receiveContext?.nack(err);
+@@ -1462,7 +1462,7 @@
+ 					res.end(JSON.stringify({ status: "ok" }));
+ 					if (body.events && body.events.length > 0) {
+ 						logVerbose(`line: received ${body.events.length} webhook events`);
+-						Promise.resolve().then(() => match.target.bot.handleWebhook(body)).catch((err) => {
++						runDetachedWebhookWork(() => match.target.bot.handleWebhook(body)).catch((err) => {
+ 							match.target.runtime.error?.(danger(`line webhook dispatch failed: ${String(err)}`));
+ 						});
+ 					}
